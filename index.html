@@ -17,18 +17,23 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
     <!-- Tesseract.js CDN (Client-Side OCR) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js"></script>
+
+    <!---SheetJS CDN(To export the log file in excel format on Client Side) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
     <!-- Application Logic -->
-    <script src="app.js" defer></script>
+    <script src="CommiIQ_app.js" defer></script>
 </head>
+
 <body class="theme-dark-yellow">
-    <div class="app-container">
+    <div class="CommiIQ_app-container">
         
         <!-- Header -->
-        <header class="app-header">
+        <header class="CommiIQ_app-header">
             <div class="logo-area">
-                <img src="logo.jpg" alt="Meetingselect Logo" class="logo-image">
+                <img src="logo2.jpeg" alt="Meetingselect Logo" class="logo-image">
                 <div>
-                    <h1>Meetingselect Invoice Analyzer for commission</h1>
+                    <h1>CommiIQ Analyzer for commission</h1>
                     <p class="subtitle">Extract, search, and audit invoice items securely in your browser</p>
                 </div>
             </div>
@@ -40,14 +45,28 @@
         </header>
 
         <!-- Main Body Grid -->
-        <main class="app-main">
+        <main class="CommiIQ_app-main">
             
             <!-- Left Column: Upload and Security Info -->
             <section class="card upload-card">
+                
+                <div class="pdf-type-selector">
+                    <label>
+                        <input type="radio" name="pdfType" value="scanned" checked>
+                            Scanned PDF → requires OCR
+                    </label>
+
+                    <label>
+                        <input type="radio" name="pdfType" value="text">
+                            Text-based PDF → skip OCR
+                    </label>
+                </div>
+                
                 <div class="card-header">
                     <h2><i class="fa-solid fa-cloud-arrow-up"></i> Upload Invoice</h2>
                 </div>
                 
+
                 <div id="dropzone" class="dropzone">
                     <input type="file" id="fileInput" accept="application/pdf" class="file-input">
                     <div class="dropzone-content">
@@ -76,7 +95,7 @@
                     <div id="securityTimer" class="security-timer hidden">
                         <div class="timer-badge">
                             <i class="fa-solid fa-shield-halved text-shield"></i>
-                            <span>Auto-deleting data in: <strong id="countdownDisplay">20:00</strong></span>
+                            <span>Auto-deleting data in: <strong id="countdownDisplay">21:00</strong></span>
                         </div>
                         <button id="clearDataBtn" class="btn btn-danger btn-sm" title="Delete current data and start over">
                             <i class="fa-solid fa-trash-can"></i> Delete Now
@@ -94,16 +113,32 @@
                 <div class="search-management">
                     <p class="section-desc">Add key descriptions or billing terms you want to search and sum within this invoice.</p>
                     
+                    <div class="preset-controls">
+                        <select id="presetSelect" class="preset-select">
+                            <option value="">— Load saved term list —</option>
+                        </select>
+                        <button id="savePresetBtn" class="btn btn-secondary btn-sm" title="Save current terms as a named list">
+                            <i class="fa-solid fa-floppy-disk"></i> Save As...
+                        </button>
+                        <button id="deletePresetBtn" class="btn btn-secondary btn-sm" title="Delete the selected saved list" disabled>
+                            <i class="fa-solid fa-trash-can"></i>
+                        </button>
+                    </div>
+
+                    <div id="termSuggestions" class="term-suggestions hidden"></div>
+
                     <div id="searchTermsList" class="search-terms-list">
                         <!-- Term inputs will be generated dynamically here -->
                         <div class="term-input-row">
-                            <input type="text" placeholder="e.g. Night Stay, Room, Package Charge, Logies" class="term-input">
+                            <input type="text" placeholder="e.g. Night Stay, Room, Package Charge, Logies, Ontbijt" class="term-input">
                             <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove term">
                                 <i class="fa-solid fa-xmark"></i>
                             </button>
                         </div>
                     </div>
                     
+
+
                     <div class="search-actions">
                         <button id="addTermBtn" class="btn btn-secondary btn-sm">
                             <i class="fa-solid fa-plus"></i> Add Term
@@ -120,8 +155,9 @@
         </main>
         
         <!-- Premium Footer -->
-        <footer class="app-footer-bar">
-            <p>Built with <i class="fa-solid fa-heart footer-heart"></i> by <strong>Saksham Setia</strong></p>
+        <footer class="CommiIQ_app-footer-bar">
+            <p>Built with <i class="fa-solid fa-heart footer-heart"></i> by <strong>SAKSHAM SETIA</strong></p>
+            <p> AI power coming soon...</p>
         </footer>
     </div>
 </body>
