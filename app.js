@@ -1,518 +1,1217 @@
 // Configure PDF.js Worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
-
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
 // ==========================================
-// Application State Management
+// Application State
 // ==========================================
 let appState = {
-    extractedRows: [], // Array of { Page, Date, RowText, BaseAmount, VatAmount, VatRate }
-    countdownSeconds: 1200, // 20 minutes
-    timerInterval: null
+    extractedRows: [],
+    countdownSeconds: 1260,
+    timerInterval: null,
+    currencySymbol: '',
+    uploadedFileBaseName: 'invoice'
 };
 
 // ==========================================
-// UI Elements Cache
+// UI Cache
 // ==========================================
 const DOM = {
-    themeToggleBtn: document.getElementById('themeToggleBtn'),
-    dropzone: document.getElementById('dropzone'),
-    fileInput: document.getElementById('fileInput'),
+    themeToggleBtn:      document.getElementById('themeToggleBtn'),
+    dropzone:            document.getElementById('dropzone'),
+    fileInput:           document.getElementById('fileInput'),
     fileStatusContainer: document.getElementById('fileStatusContainer'),
-    fileNameDisplay: document.getElementById('fileNameDisplay'),
-    fileSizeDisplay: document.getElementById('fileSizeDisplay'),
-    progressIndicator: document.getElementById('progressIndicator'),
-    progressBar: document.getElementById('progressBar'),
-    progressText: document.getElementById('progressText'),
-    securityTimer: document.getElementById('securityTimer'),
-    countdownDisplay: document.getElementById('countdownDisplay'),
-    clearDataBtn: document.getElementById('clearDataBtn'),
-    searchTermsList: document.getElementById('searchTermsList'),
-    addTermBtn: document.getElementById('addTermBtn'),
-    searchBtn: document.getElementById('searchBtn'),
-    resultsSection: document.getElementById('resultsSection')
+    fileNameDisplay:     document.getElementById('fileNameDisplay'),
+    fileSizeDisplay:     document.getElementById('fileSizeDisplay'),
+    progressIndicator:   document.getElementById('progressIndicator'),
+    progressBar:         document.getElementById('progressBar'),
+    progressText:        document.getElementById('progressText'),
+    securityTimer:       document.getElementById('securityTimer'),
+    countdownDisplay:    document.getElementById('countdownDisplay'),
+    clearDataBtn:        document.getElementById('clearDataBtn'),
+    searchTermsList:     document.getElementById('searchTermsList'),
+    addTermBtn:          document.getElementById('addTermBtn'),
+    searchBtn:           document.getElementById('searchBtn'),
+    resultsSection:      document.getElementById('resultsSection'),
+    presetSelect:        document.getElementById('presetSelect'),
+    savePresetBtn:       document.getElementById('savePresetBtn'),
+    deletePresetBtn:     document.getElementById('deletePresetBtn'),
+    termSuggestions:     document.getElementById('termSuggestions'),
+    pdfTypeRadios:       () => document.querySelector('input[name="pdfType"]:checked')
 };
 
+function safeDetectCurrency(textBlocks) {
+
+    const text = textBlocks.join(' ').slice(0, 5000);
+
+    // Symbol near amount
+    const near = text.match(/([€$£¥₹Kč])\s?\d/);
+    if (near) return near[1];
+
+    // Symbol fallback
+    if (text.includes('£')) return '£';
+    if (text.includes('€')) return '€';
+    if (text.includes('$')) return '$';
+    if (text.includes('¥')) return '¥';
+    if (text.includes('₹')) return '₹';
+
+    // Frequency-based code detection
+    const matches = text.match(/\b(USD|EUR|GBP|INR|AUD|CAD|SGD|AED|SAR|CHF|CZK|SEK|NOK|DKK|PLN|HUF|RON|JPY|CNY|HKD|NZD|ZAR)\b/gi);
+
+    if (matches) {
+        const freq = {};
+        matches.forEach(m => {
+            const key = m.toUpperCase();
+            freq[key] = (freq[key] || 0) + 1;
+        });
+
+        const mostCommon = Object.keys(freq).reduce((a, b) =>
+            freq[a] > freq[b] ? a : b
+        );
+
+        const map = {
+            USD: '$', EUR: '€', GBP: '£', INR: '₹',
+            AUD: '$', CAD: '$', SGD: '$',
+            AED: 'AED ', SAR: 'SAR ',
+            CHF: 'CHF ', CZK: 'Kč',
+            SEK: 'SEK ', NOK: 'NOK ', DKK: 'DKK ',
+            PLN: 'PLN ', HUF: 'HUF ', RON: 'RON ',
+            JPY: '¥', CNY: '¥', HKD: '$', NZD: '$',
+            ZAR: 'ZAR '
+        };
+
+        return map[mostCommon] || '';
+    }
+
+    return '';
+}
+
+
 // ==========================================
-// Regex Search & Formatting Systems
+// Currency Detection
 // ==========================================
+function detectCurrency(text) {
+    if (Array.isArray(text)) text = text.join(' ');
+    const map = { EUR:'€', GBP:'£', USD:'$', CHF:'CHF ', CZK:'CZK ',
+                  SEK:'SEK ', NOK:'NOK ', DKK:'DKK ', PLN:'PLN ', HUF:'HUF ' };
+    const code = text.match(/\b(EUR|GBP|USD|CHF|CZK|SEK|NOK|DKK|PLN|HUF)\b/);
+    if (code) return map[code[1]] || code[1]+' ';
+    const gbp = (text.match(/£/g)||[]).length;
+    const eur = (text.match(/€/g)||[]).length;
+    if (gbp > eur) return '£';
+    if (eur > 0)   return '€';
+    if ((text.match(/\$/g)||[]).length > 0) return '$';
+    return '€';
+}
+
+// ==========================================
+// Date Patterns
+// ==========================================
+const MONTH_NAMES = /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)$/i;
 const DATE_PATTERNS = [
-    // YYYY.MM.DD, YYYY-MM-DD or YYYY/MM/DD
-    /\b(\d{4}[-.\/]\d{1,2}[-.\/]\d{1,2})\b/,
-    // DD.MM.YYYY, DD-MM-YYYY, DD/MM/YYYY, MM.DD.YYYY, etc.
-    /\b(\d{1,2}[-.\/]\d{1,2}[-.\/]\d{2,4})\b/,
-    // DD-MMM-YYYY or DD.MMM.YYYY
-    /\b(\d{1,2}[-.\/][A-Za-z]{3,9}[-.\/]\d{2,4})\b/,
-    // Month DD, YYYY
+    /\b(\d{4}[-.\\/]\d{1,2}[-.\\/]\d{1,2})\b/,
+    /\b(\d{1,2}[-.\\/]\d{1,2}[-.\\/]\d{2,4})\b/,
+    /\b(\d{1,2}[-.\\/][A-Za-z]{3,9}[-.\\/]\d{2,4})\b/,
+    /\b(\d{1,2}[\s\-][A-Za-z]{3,9}[\s\-]\d{2,4})\b/,
     /\b([A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4})\b/i
 ];
 
 function extractDate(line) {
-    for (const pattern of DATE_PATTERNS) {
-        const match = line.match(pattern);
-        if (match) return match[1];
+    for (const pat of DATE_PATTERNS) {
+        const m = line.match(pat);
+        if (m) return m[1] || m[0];
     }
-    return '';
+    return null;
 }
 
-function parseNumberString(str) {
-    let digitsOnly = str.replace(/[^\d.,-]/g, ''); // Keep numbers, decimals, commas, minus
-    if (!digitsOnly) return 0.0;
-    
-    // Handle European commas vs standard decimals
-    if (digitsOnly.includes('.') && digitsOnly.includes(',')) {
-        if (digitsOnly.lastIndexOf(',') > digitsOnly.lastIndexOf('.')) {
-            digitsOnly = digitsOnly.replace(/\./g, '').replace(',', '.'); // European
-        } else {
-            digitsOnly = digitsOnly.replace(/,/g, ''); // Standard
-        }
-    } else if (digitsOnly.includes(',')) {
-        const parts = digitsOnly.split(',');
-        if (parts[parts.length - 1].length === 3) {
-            digitsOnly = digitsOnly.replace(/,/g, ''); // Thousands separator
-        } else {
-            digitsOnly = digitsOnly.replace(',', '.'); // Decimal comma
-        }
+
+function extractDateAtStart(line) {
+    // OCR noise correction
+    const corrected = line
+        .replace(/^([|\s=]*)O(\d)/, '$10$2')
+        .replace(/(\d)O(\d)/g, '$10$2')
+        .replace(/(\d)\s*-\s*(\d)/g, '$1-$2');
+
+    // Allow OCR noise chars (|, =, spaces) before the date
+    const noiseStripped = corrected.replace(/^[\s|=]+/, '');
+    const seg = noiseStripped.substring(0, 20);
+
+    for (const pat of DATE_PATTERNS) {
+        const m = seg.match(pat);
+        if (!m) continue;
+        const idx    = seg.indexOf(m[0]);
+        const prefix = seg.substring(0, idx);
+        if (!/^[^\w]*$/.test(prefix)) continue;
+        const captured   = m[1] || m[0];
+        const alphaToken = captured.match(/[A-Za-z]{3,9}/);
+        if (alphaToken && !MONTH_NAMES.test(alphaToken[0])) continue;
+        return captured;
     }
-    return parseFloat(digitsOnly) || 0.0;
+    return null;
 }
 
+// ==========================================
+// Number Parser
+// ==========================================
+function parseNumberString(s) {
+    let str = s.replace(/[£€$\s]/g, '').trim();
+    if (!str) return 0;
+    const dots   = (str.match(/\./g)||[]).length;
+    const commas = (str.match(/,/g) ||[]).length;
+    if (dots > 0 && commas > 0) {
+        str = str.lastIndexOf(',') > str.lastIndexOf('.')
+            ? str.replace(/\./g,'').replace(',','.')  // European 1.234,56
+            : str.replace(/,/g,'');                    // Standard  1,234.56
+    } else if (commas === 1) {
+        const p = str.split(',');
+        str = (p[1] && p[1].length === 3) ? str.replace(',','') : str.replace(',','.');
+    } else if (dots > 1) {
+        str = str.replace(/\./g,'');
+    }
+    return parseFloat(str) || 0;
+}
+
+// ==========================================
+// Amount Extractor  (mirrors Python notebook: rightmost NN.NN wins)
+// ==========================================
 function parseAmountAndVat(line) {
-    let baseAmount = 0.0;
+
+    line = line.replace(
+    /\b(\d{1,3}(?:\.\d{3})+)\.(\d{2})\b/g,
+    (match) => {
+        const parts = match.split('.');
+        const decimal = parts.pop();
+        return parts.join('') + '.' + decimal;
+    }
+);
+
     let vatAmount = 0.0;
-    let vatRate = null; // null represents N/A (no rate listed)
-    
-    // Localized OCR correction
-    let cleanLine = line.replace(/(?<=\d)O|O(?=\d)/g, '0');
-    
-    // 1. Extract VAT rate percentage (e.g. 21%, 10%, 22%) first to prevent splitting digits
-    const rateRegex = /\b(\d{1,2})\s*%/;
-    const rateMatch = cleanLine.match(rateRegex);
-    if (rateMatch) {
-        vatRate = parseInt(rateMatch[1], 10);
-    }
-    
-    // 2. Extract VAT amount if it is explicitly written next to a percentage inside parentheses, e.g. €57,10 (21 %)
-    const vatAmountPattern = /(?:[\$\u20AC\u00A3\u00A5\u20AC€]\s*)?(-?[0-9]{1,3}(?:[.,\s][0-9]{3})*(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)\s*\(\s*\d+\s*%\s*\)/;
-    const vatAmountMatch = cleanLine.match(vatAmountPattern);
-    if (vatAmountMatch) {
-        vatAmount = parseNumberString(vatAmountMatch[1]);
-        // Remove the matched block (e.g. €57,10 (21 %)) so it is not double-parsed
-        cleanLine = cleanLine.replace(vatAmountMatch[0], '');
-    } else if (rateMatch) {
-        // If there was a rate percentage like 10% or 22% but no VAT amount inside parentheses,
-        // clean just the percentage token (e.g. "10%") from the line.
-        cleanLine = cleanLine.replace(rateMatch[0], '');
-    }
-    
-    // Clean any residual percent structures
-    cleanLine = cleanLine.replace(/\b\d+(?:\.\d+)?\s*%/g, '');
-    cleanLine = cleanLine.replace(/\(\s*\)/g, '');
-    
-    // Capture remaining base amounts (negatives, standard formats)
-    const amountPattern = /(?:^|\s|\b)(?:-|negative)?\s*[\$\u20AC\u00A3\u00A5\u20AC€]?\s*\(?\s*([0-9]{1,3}(?:[.,\s][0-9]{3})*(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)\s*\)?/g;
-    
-    const validAmounts = [];
-    let match;
-    while ((match = amountPattern.exec(cleanLine)) !== null) {
-        const valStr = match[0].trim();
-        const isNegative = valStr.startsWith('-') || (valStr.startsWith('(') && valStr.endsWith(')'));
-        
-        let digitsOnly = valStr.replace(/[^\d.,]/g, '');
-        if (!digitsOnly) continue;
-        
-        // Check if this number string has a decimal component (.00, ,90, .9, etc.)
-        const hasDecimal = /[.,]\d{1,2}\b/.test(valStr);
-        
-        const val = parseNumberString(digitsOnly);
-        if (!isNaN(val)) {
-            validAmounts.push({
-                value: isNegative ? -val : val,
-                hasDecimal: hasDecimal
-            });
+    let vatRate   = null;
+
+    let s = line.replace(/(\d)O/g,'$10').replace(/O(\d)/g,'0$1');
+    // Strip non-amount numeric noise (check/folio numbers, calendar years)
+    // before the amount-matching regexes below run.
+    s = s.replace(/CHECK#?\s*\d+\b/gi, '');
+    s = s.replace(/\b(19|20)\d{2}\b/g, '');
+
+    const rm = s.match(/\b(\d{1,2}(?:\.\d+)?)\s*%/);
+    if (rm) { vatRate = parseInt(rm[1], 10); s = s.replace(rm[0], ''); }
+
+    // Strategy A: standard decimal point  152.65  1,548.00
+    const std = s.match(/\d[\d,]*\.\d{2}/g);
+    // Strategy B: European decimal comma  152,65  1.548,00
+    const eur = s.match(/\d[\d.]*,\d{2}/g);
+
+    let chosen = null, isEur = false;
+    if (std && eur) { isEur = eur.length > std.length; chosen = isEur ? eur : std; }
+    else if (std)   { chosen = std; }
+    else if (eur)   { chosen = eur; isEur = true; }
+
+   let baseAmount = 0;
+
+if (chosen && chosen.length > 0) {
+
+    const parsedValues = chosen.map(val => {
+    let num = val.trim();
+
+    const dotCount = (num.match(/\./g) || []).length;
+    const commaCount = (num.match(/,/g) || []).length;
+
+// Case: 7.500.00 → treat as 7500.00
+if (dotCount > 1 && commaCount === 0) {
+    const parts = num.split('.');
+    const decimal = parts.pop();
+    num = parts.join('') + '.' + decimal;
+}
+
+        // Case 1: US format (1,234.56 or 28,295.95)
+        if (/^\d{1,3}(,\d{3})*\.\d{2}$/.test(num)) {
+            num = num.replace(/,/g, '');
         }
-    }
-    
-    if (validAmounts.length > 0) {
-        const finalCandidate = validAmounts[validAmounts.length - 1];
-        
-        // HEURISTIC FIX: Only fallback to an earlier number if the rightmost number
-        // lacks a decimal (e.g. a quantity like "2") and an earlier number has a decimal.
-        // If the rightmost number has a decimal (like "7.00" or "418.00"), it is the price!
-        // This prevents Guest Folio IDs (like "9081") from being matched as prices.
-        if (validAmounts.length > 1 && !finalCandidate.hasDecimal) {
-            for (let i = validAmounts.length - 2; i >= 0; i--) {
-                if (validAmounts[i].hasDecimal) {
-                    return {
-                        baseAmount: validAmounts[i].value,
-                        vatAmount,
-                        vatRate
-                    };
-                }
+
+        // Case 2: EU format (1.234,56 or 28.295,95)
+        else if (/^\d{1,3}(\.\d{3})*,\d{2}$/.test(num)) {
+            num = num.replace(/\./g, '').replace(',', '.');
+        }
+
+        // Case 3: OCR malformed (e.g. 7.500.00)
+        else if ((num.match(/\./g) || []).length > 1) {
+            const parts = num.split('.');
+            const decimal = parts.pop();
+            num = parts.join('') + '.' + decimal;
+        }
+
+        // Case 4: only comma present
+        else if (num.includes(',')) {
+            const parts = num.split(',');
+            if (parts[1]?.length === 2) {
+                // decimal comma
+                num = num.replace(',', '.');
+            } else {
+                // thousand comma
+                num = num.replace(/,/g, '');
             }
         }
-        baseAmount = finalCandidate.value;
+
+        return parseFloat(num) || 0;
+
+    }).filter(v => v > 0);
+
+    if (parsedValues.length > 0) {
+        // Position-independent amount selection (per spec): the charge
+        // amount is the numerically LARGEST value among NET / VAT-amount /
+        // GROSS / TOTAL. Since GROSS = NET + VAT-amount and TOTAL = GROSS
+        // (when count = 1) or GROSS × count, GROSS/TOTAL is always >= the
+        // other components for non-negative VAT/count.
+        //
+        // IMPORTANT: do NOT exclude duplicate values — TC20's "Duplicate
+        // totals" case has GROSS == TOTAL (both 329.00) and the correct
+        // answer is still 329, not the smaller NET value.
+        baseAmount = Math.max(...parsedValues);
     }
-    
-    return {
-        baseAmount,
-        vatAmount,
-        vatRate
-    };
+
+    // Negative-amount detection: a true minus sign sits directly against
+    // its digit; a hyphen used as word punctuation has spaces on both
+    // sides and must not be mistaken for a negative.
+    if (baseAmount !== 0) {
+    const negativeDetected =
+        // Real negative sign: '-' directly touching a digit (no space between
+        // sign and number), e.g. "-60.00", "-1.50". A hyphen used as word
+        // punctuation always has a space on BOTH sides (e.g. "kamer - mindervalide"),
+        // so requiring no space between '-' and the digit excludes that case
+        // while still catching "- 60.00" is NOT matched here on purpose —
+        // OCR'd negatives in our invoices never insert a space after the sign,
+        // only before it (handled by allowing one space before '-').
+        /(?:^|\s)-\d/.test(line) ||
+        // "(" + digits NOT followed by "%)" → accounting-style negative, e.g. "(271,90)"
+        // "(21 %)" or "(0 %)" → VAT-rate annotation, NOT a negative
+        /\((?!\s*\d+(?:\.\d+)?\s*%\))\s*\d/.test(line) ||
+        /\bCR\b/i.test(line);
+
+    if (negativeDetected) {
+        baseAmount = -Math.abs(baseAmount);
+        }
+    }
+}
+
+    return { baseAmount, vatAmount, vatRate };
 }
 
 // ==========================================
-// Stateful Row Combiner (Reconstructs Wrapped Text)
+// Page-Type Detector
+// A page is text-based if PDF.js gives us ≥2 lines containing a date
+// (at the start OR anywhere in the line — many invoices put the date
+// mid-line, e.g. "Night 19-05-2026 19-05-2026 €271,90 ...")
+// AND at least one decimal amount. Otherwise → OCR.
+// ==========================================
+function isTextBasedPage(lines) {
+    const text = lines.join(' ');
+    if (text.length < 100) return false;
+    if (!/\d+\.\d{2}/.test(text) && !/\d+,\d{2}/.test(text)) return false;
+    let dateLines = 0;
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (extractDateAtStart(trimmed) || extractDate(trimmed)) {
+            if (++dateLines >= 2) return true;
+        }
+    }
+    return false;
+}
+
+// ==========================================
+// Stateful Row Assembler
+//
+// KEY FIX for Imperial Riding School / two-column OCR layout:
+// When Tesseract reads a two-column invoice, it outputs:
+//   Col-left lines (date + description) first,
+//   then all Col-right lines (amounts) as orphan lines at the bottom.
+//
+// Standard approach: amounts are on the same OCR line as the date → groups have amounts.
+// Two-column fallback: if a group has NO amount but orphan amount lines exist,
+//   assign amounts sequentially to groups in order (first orphan → first no-amount group).
 // ==========================================
 function reconstructInvoiceLines(lines) {
-    const assembled = [];
+    const rows = [];
     let currentItem = null;
-    
-    for (const line of lines) {
-        const lineClean = line.trim();
-        if (!lineClean) continue;
-        
-        const date = extractDate(lineClean);
-        
-        // Remove date from amount validation target to avoid number confusion
-        let cleanForVat = lineClean;
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+
+        const date = extractDateAtStart(line) || extractDate(line) || '';
+
+        let cleanForAmt = line;
         if (date) {
-            // Replaces all occurrences of the extracted date string with space
-            const escapedDate = date.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            cleanForVat = cleanForVat.replace(new RegExp(escapedDate, 'g'), '');
+            const esc = date.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            cleanForAmt = cleanForAmt.replace(new RegExp(esc, 'g'), '');
         }
-        
-        const details = parseAmountAndVat(cleanForVat);
-        
+
+        const details = parseAmountAndVat(cleanForAmt);
+
         if (currentItem) {
-            // Merge A: Item has a date but no base amount, and this new line provides the amount
+            // ✅ Merge A: date line without amount, next line has amount
             if (currentItem.Date && !currentItem.BaseAmount && details.baseAmount) {
-                currentItem.RowText += " | " + lineClean;
+                currentItem.RowText += " | " + line;
                 currentItem.BaseAmount = details.baseAmount;
                 currentItem.VatAmount = details.vatAmount;
                 currentItem.VatRate = details.vatRate;
                 continue;
             }
-            // Merge B: Line has no date and no amount (wrapped details)
+
+            // Merge B: continuation text
             if (!date && !details.baseAmount && !details.vatAmount) {
-                currentItem.RowText += " | " + lineClean;
+                currentItem.RowText += " | " + line;
                 continue;
             }
         }
-        
-        if (currentItem) {
-            assembled.push(currentItem);
-        }
-        
+
+        if (currentItem) rows.push(currentItem);
+
         currentItem = {
-            Date: date ? date : '',
-            RowText: lineClean,
+            Date: date || '',
+            RowText: line,
             BaseAmount: details.baseAmount,
             VatAmount: details.vatAmount,
             VatRate: details.vatRate
         };
     }
-    
-    if (currentItem) {
-        assembled.push(currentItem);
+
+    if (currentItem) rows.push(currentItem);
+
+    // CRITICAL: ORPHAN AMOUNT PASS (this fixes your count)
+    const orphanAmounts = [];
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+
+        if (!/[A-Za-z]/.test(line) && !extractDateAtStart(line)) {
+            const matches = line.match(/\d[\d,]*\.\d{2}/g);
+            if (matches) {
+                matches.forEach(m => {
+                    const val = parseFloat(m.replace(/,/g, ''));
+                    if (val > 0) orphanAmounts.push(val);
+                });
+            }
+        }
     }
-    
-    return assembled;
+
+    if (orphanAmounts.length > 0) {
+        let idx = 0;
+        for (const row of rows) {
+            if (
+    row.BaseAmount === 0 &&
+    row.VatRate !== 0 &&              
+    !/tax|fee/i.test(row.RowText) &&  
+    idx < orphanAmounts.length
+) {
+    row.BaseAmount = orphanAmounts[idx++];
+}
+        }
+    }
+
+    if (rows.length === 0 && lines.length > 0) {
+    const fallbackRows = [];
+
+    for (const line of lines) {
+        const details = parseAmountAndVat(line);
+
+        if (details.baseAmount !== 0) {
+            fallbackRows.push({
+                Date: '',
+                RowText: line,
+                BaseAmount: details.baseAmount,
+                VatAmount: details.vatAmount,
+                VatRate: details.vatRate
+            });
+        }
+    }
+
+    return fallbackRows;
 }
 
+    return rows;
+}
+
+
 // ==========================================
-// Layout-Aware PDF Text Extractor
+// PDF Text Extractor (layout-aware)
 // ==========================================
 async function extractTextFromPDFPage(page) {
-    const textContent = await page.getTextContent();
-    const items = textContent.items;
-    
-    const lines = {};
-    for (const item of items) {
+    const content  = await page.getTextContent();
+    const clusters = {};
+
+    for (const item of content.items) {
         if (!item.str.trim()) continue;
         const y = Math.round(item.transform[5]);
         const x = item.transform[4];
-        
-        let clusterY = null;
-        for (const existingY of Object.keys(lines)) {
-            if (Math.abs(existingY - y) < 4) {
-                clusterY = existingY;
-                break;
-            }
+        let   ky = null;
+        for (const ey of Object.keys(clusters)) {
+            if (Math.abs(Number(ey) - y) <= 3) { ky = ey; break; }
         }
-        
-        if (clusterY !== null) {
-            lines[clusterY].push({ x, str: item.str });
-        } else {
-            lines[y] = [{ x, str: item.str }];
-        }
+        const key = ky !== null ? ky : y;
+        if (!clusters[key]) clusters[key] = [];
+        clusters[key].push({ x, str: item.str, width: item.width || 0 });
     }
-    
-    const sortedY = Object.keys(lines).map(Number).sort((a, b) => b - a);
+
+    const sortedY = Object.keys(clusters).map(Number).sort((a,b) => b-a);
     return sortedY.map(y => {
-        const sortedItems = lines[y].sort((a, b) => a.x - b.x);
-        return sortedItems.map(item => item.str).join(" ");
+        const tokens = clusters[y].sort((a,b) => a.x - b.x);
+        let result = '';
+        for (let i=0; i<tokens.length; i++) {
+            if (i===0) { result = tokens[i].str; continue; }
+            const gap = tokens[i].x - (tokens[i-1].x + tokens[i-1].width);
+            if (gap > 40) {
+                result += '    ';   // big gap → new column
+            } else if (gap > 15) {
+                result += '  ';     // medium gap
+                } else {
+            result += ' '; 
+            }
+        result += tokens[i].str;
+        }
+        return result;
     });
 }
 
-function checkPageAlphanumericRatio(lines) {
-    const text = lines.join(" ");
-    if (text.length < 50) return false;
-    
-    const alphanumericCount = (text.match(/[a-zA-Z0-9]/g) || []).length;
-    return (alphanumericCount / text.length) >= 0.3;
-}
-
 // ==========================================
-// Core Parser Routing Pipeline (Scheduler Parallel Queue)
+// Canvas Renderer
 // ==========================================
-async function processInvoice(arrayBuffer) {
-    appState.extractedRows = [];
-    updateProgressBar(5, "Loading PDF document...");
-    
-    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-    const pdf = await loadingTask.promise;
-    const totalPages = pdf.numPages;
-    
-    const scannedJobs = [];
-    
-    // 1. Pre-scan all pages to execute text extracts and queue scanned targets
-    for (let i = 1; i <= totalPages; i++) {
-        updateProgressBar(Math.round((i / totalPages) * 15) + 5, `Pre-scanning layouts (Page ${i}/${totalPages})...`);
-        const page = await pdf.getPage(i);
-        const textLines = await extractTextFromPDFPage(page);
-        
-        const isTextBased = checkPageAlphanumericRatio(textLines);
-        if (isTextBased) {
-            const items = reconstructInvoiceLines(textLines);
-            items.forEach(item => {
-                if (item.BaseAmount !== 0 || item.VatAmount !== 0) {
-                    appState.extractedRows.push({
-                        Page: i,
-                        Date: item.Date,
-                        RowText: item.RowText,
-                        BaseAmount: item.BaseAmount,
-                        VatAmount: item.VatAmount,
-                        VatRate: item.VatRate
-                    });
-                }
-            });
-        } else {
-            const canvas = await renderPageToCanvas(page);
-            scannedJobs.push({
-                pageNum: i,
-                canvas: canvas
-            });
-        }
-    }
-    
-    // 2. Parallel OCR Queue Execution via Web Workers Scheduler
-    if (scannedJobs.length > 0) {
-        const totalScanned = scannedJobs.length;
-        updateProgressBar(22, `Spawning concurrent OCR workers for ${totalScanned} scanned pages...`);
-        
-        const scheduler = Tesseract.createScheduler();
-        
-        // Spawn up to 4 parallel workers to run OCR concurrently
-        const concurrency = Math.min(4, totalScanned);
-        const workers = [];
-        for (let w = 0; w < concurrency; w++) {
-            const worker = await Tesseract.createWorker();
-            await worker.loadLanguage('eng');
-            await worker.initialize('eng');
-            scheduler.addWorker(worker);
-            workers.push(worker);
-        }
-        
-        let completedJobs = 0;
-        updateProgressBar(25, `Running parallel OCR (0/${totalScanned} pages completed)...`);
-        
-        const ocrPromises = scannedJobs.map(job => {
-            return scheduler.addJob('recognize', job.canvas)
-                .then(result => {
-                    completedJobs++;
-                    const progressVal = Math.round((completedJobs / totalScanned) * 70) + 25;
-                    updateProgressBar(progressVal, `Running parallel OCR (${completedJobs}/${totalScanned} pages completed)...`);
-                    
-                    const ocrLines = result.data.text.split("\n");
-                    const items = reconstructInvoiceLines(ocrLines);
-                    items.forEach(item => {
-                        if (item.BaseAmount !== 0 || item.VatAmount !== 0) {
-                            appState.extractedRows.push({
-                                Page: job.pageNum,
-                                Date: item.Date,
-                                RowText: item.RowText,
-                                BaseAmount: item.BaseAmount,
-                                VatAmount: item.VatAmount,
-                                VatRate: item.VatRate
-                            });
-                        }
-                    });
-                })
-                .catch(err => {
-                    console.error(`OCR failed on page ${job.pageNum}:`, err);
-                    completedJobs++;
-                });
-        });
-        
-        await Promise.all(ocrPromises);
-        await scheduler.terminate();
-    }
-    
-    updateProgressBar(100, "Invoice parsed successfully!");
-    
-    // Sort array by Page order since parallel OCR executes asynchronously
-    appState.extractedRows.sort((a, b) => a.Page - b.Page);
-    
-    setTimeout(() => {
-        DOM.progressIndicator.classList.add('hidden');
-        DOM.searchBtn.disabled = false;
-        startSecurityTimer();
-    }, 1200);
-}
-
 async function renderPageToCanvas(page) {
-    const viewport = page.getViewport({ scale: 2.0 });
+    const vp = page.getViewport({ scale: 2.0 });
     const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-    canvas.height = viewport.height;
-    canvas.width = viewport.width;
-    
-    const renderContext = {
-        canvasContext: context,
-        viewport: viewport
-    };
-    await page.render(renderContext).promise;
+    canvas.width  = vp.width;
+    canvas.height = vp.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
     return canvas;
 }
 
 // ==========================================
-// Interactive Audit Search Logic
+// Text-Based PDF Processing
+// Simple, direct extraction for clean text PDFs:
+// - No OCR, no isTextBasedPage check needed
+// - For each line, VAT rate comes from "NN %" pattern
+// - Amount is always the RIGHTMOST decimal number (last column = gross incl. VAT)
+// - Negative detection via leading "-" or "(amount)"
 // ==========================================
-function executeAuditSearch() {
-    if (appState.extractedRows.length === 0) return;
-    
-    const termInputs = DOM.searchTermsList.querySelectorAll('.term-input');
-    const terms = [];
-    termInputs.forEach(input => {
-        const val = input.value.trim();
-        if (val) terms.push(val);
+async function processInvoiceText(arrayBuffer) {
+    appState.extractedRows  = [];
+    appState.currencySymbol = '';
+    updateProgressBar(5, 'Loading PDF (text mode)...');
+
+    const pdf        = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const totalPages = pdf.numPages;
+    let   allRawText = '';
+
+    for (let i = 1; i <= totalPages; i++) {
+        updateProgressBar(Math.round((i / totalPages) * 90) + 5,
+                          `Extracting text page ${i}/${totalPages}...`);
+        const page      = await pdf.getPage(i);
+        const textLines = await extractTextFromPDFPage(page);
+        allRawText     += textLines.join(' ') + ' ';
+
+        const rows = reconstructInvoiceLinesText(textLines);
+        rows.forEach(r => {
+            if (r.BaseAmount !== 0 || r.VatAmount !== 0) {
+                appState.extractedRows.push({ Page: i, ...r });
+            }
+        });
+    }
+
+    appState.currencySymbol = safeDetectCurrency([allRawText]);
+    appState.extractedRows.sort((a, b) => a.Page - b.Page);
+    renderTermSuggestions();
+
+    updateProgressBar(100, `Done — ${appState.extractedRows.length} line items extracted.`);
+    setTimeout(() => {
+        DOM.progressIndicator.classList.add('hidden');
+        DOM.searchBtn.disabled = false;
+        startSecurityTimer();
+    }, 1000);
+}
+
+// Row assembler for text-based PDFs:
+// Same date-grouping logic but amount extraction always picks the RIGHTMOST
+// decimal number in the line — no Math.max, no OCR noise heuristics needed.
+function reconstructInvoiceLinesText(lines) {
+    const rows       = [];
+    let   currentItem = null;
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+
+        const date = extractDateAtStart(line) || extractDate(line) || '';
+
+        // Extract VAT rate
+        let vatRate = null;
+        const rm = line.match(/\b(\d{1,2}(?:\.\d+)?)\s*%/);
+        if (rm) vatRate = parseInt(rm[1], 10);
+
+        // Strip noise before amount search
+        let cleanLine = line;
+        if (date) cleanLine = cleanLine.replace(
+            new RegExp(date.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '');
+        cleanLine = cleanLine.replace(/CHECK#?\s*\d+\b/gi, '');
+        cleanLine = cleanLine.replace(/\b(19|20)\d{2}\b/g, '');
+        if (rm) cleanLine = cleanLine.replace(rm[0], '');
+
+        // Find all decimal numbers; take RIGHTMOST = last column (gross incl. VAT)
+        const stdMatches = cleanLine.match(/\d[\d,]*\.\d{2}/g);
+        const eurMatches = cleanLine.match(/\d[\d.]*,\d{2}/g);
+
+        let chosen = null, isEur = false;
+        if (stdMatches && eurMatches) {
+            isEur   = eurMatches.length > stdMatches.length;
+            chosen  = isEur ? eurMatches : stdMatches;
+        } else if (stdMatches) {
+            chosen  = stdMatches;
+        } else if (eurMatches) {
+            chosen  = eurMatches;
+            isEur   = true;
+        }
+
+        let baseAmount = 0;
+        if (chosen && chosen.length > 0) {
+            let raw2 = chosen[chosen.length - 1]; // rightmost = gross column
+            raw2     = isEur
+                ? raw2.replace(/\./g, '').replace(',', '.')
+                : raw2.replace(/,/g, '');
+            baseAmount = parseFloat(raw2) || 0;
+
+            // Negative detection: real minus sign sits directly against its
+            // digit (no space between sign and number). A hyphen used as
+            // word punctuation always has a space on BOTH sides
+            // (e.g. "kamer - mindervalide"), so that case is excluded.
+            // Accounting parens "(amount)" still count, but NOT VAT-rate
+            // parens like "(21 %)".
+            if (baseAmount !== 0) {
+                const negTest =
+                    /(?:^|\s)-\d/.test(line) ||
+                    /\((?!\s*\d+(?:\.\d+)?\s*%\))\s*\d/.test(line) ||
+                    /\bCR\b/i.test(line);
+                if (negTest) baseAmount = -Math.abs(baseAmount);
+            }
+        }
+
+        const details = { baseAmount, vatAmount: 0, vatRate };
+
+        if (currentItem) {
+            // Merge A: previous row had a date but no amount, this line has an amount
+            if (currentItem.Date && !currentItem.BaseAmount && details.baseAmount) {
+                currentItem.RowText    += ' | ' + line;
+                currentItem.BaseAmount  = details.baseAmount;
+                currentItem.VatRate     = details.vatRate ?? currentItem.VatRate;
+                continue;
+            }
+            // Merge B: continuation line (no date, no amount)
+            if (!date && !details.baseAmount) {
+                currentItem.RowText += ' | ' + line;
+                continue;
+            }
+        }
+
+        if (currentItem) rows.push(currentItem);
+        currentItem = {
+            Date:       date || '',
+            RowText:    line,
+            BaseAmount: details.baseAmount,
+            VatAmount:  0,
+            VatRate:    details.vatRate
+        };
+    }
+
+    if (currentItem) rows.push(currentItem);
+    return rows;
+}
+
+// ==========================================
+// Core Processing Pipeline
+// ==========================================
+async function processInvoice(arrayBuffer, pdfType) {
+    // Delegate immediately for text-based PDFs — no OCR, simpler extraction
+    if (pdfType === 'text') {
+        return processInvoiceText(arrayBuffer);
+    }
+
+    // --- SCANNED / OCR path below ---
+    appState.extractedRows  = [];
+    appState.currencySymbol = '';
+    updateProgressBar(5, 'Loading PDF...');
+
+    const pdf        = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const totalPages = pdf.numPages;
+    const scannedJobs = [];
+    let   allRawText  = '';
+
+    // Phase 1: classify each page
+    for (let i = 1; i <= totalPages; i++) {
+        updateProgressBar(Math.round((i/totalPages)*20)+5, `Scanning page ${i}/${totalPages}...`);
+        const page      = await pdf.getPage(i);
+        const canvas    = await renderPageToCanvas(page);   // always pre-render
+        const textLines = await extractTextFromPDFPage(page);
+        allRawText     += textLines.join(' ') + ' ';
+
+        if (isTextBasedPage(textLines)) {
+            const rows = reconstructInvoiceLines(textLines);
+            const hasRows = rows.some(r => r.BaseAmount !== 0 || r.VatAmount !== 0);
+            if (!hasRows) {
+                scannedJobs.push({ pageNum: i, canvas });
+            } else {
+                const pageResults = rows
+    .filter(r => r.BaseAmount !== 0 || r.VatAmount !== 0)
+    .map(r => ({ Page: i, ...r }));
+
+appState.extractedRows.push(...pageResults);
+            }
+        } else {
+            scannedJobs.push({ pageNum: i, canvas });
+        }
+    }
+
+    if (!appState.currencySymbol && allRawText.length > 0) {
+    appState.currencySymbol = safeDetectCurrency([allRawText]);
+}
+
+
+    // Phase 2: Fast parallel OCR using scheduler with multiple workers
+    if (scannedJobs.length > 0) {
+        const totalScanned = scannedJobs.length;
+        updateProgressBar(25, `Starting OCR on ${totalScanned} page(s)...`);
+
+        const scheduler  = Tesseract.createScheduler();
+        const WORKERS = Math.min(
+    Math.max(2, Math.floor((navigator.hardwareConcurrency || 4) / 2)),
+    totalScanned,
+    6
+);
+        const workerList = [];
+
+        try {
+            for (let w = 0; w < WORKERS; w++) {
+                const worker = await Tesseract.createWorker({
+                    workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/worker.min.js',
+                    corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@4/tesseract-core.wasm.js'
+                });
+                await worker.loadLanguage('eng');
+                await worker.initialize('eng');
+                scheduler.addWorker(worker);
+                workerList.push(worker);
+            }
+        } catch (err) {
+            console.error('❌ Worker pool init failed:', err);
+            updateProgressBar(100, 'OCR unavailable.');
+            setTimeout(() => {
+                DOM.progressIndicator.classList.add('hidden');
+                DOM.searchBtn.disabled = appState.extractedRows.length === 0;
+                if (appState.extractedRows.length > 0) startSecurityTimer();
+            }, 800);
+            return;
+        }
+
+        let done = 0;
+
+        // All jobs run in parallel — scheduler distributes across workers
+        const jobs = scannedJobs.map(job =>
+            scheduler.addJob('recognize', job.canvas)
+                .then(result => {
+    done++;
+    updateProgressBar(
+        Math.round((done / totalScanned) * 70) + 25,
+        `OCR ${done}/${totalScanned} pages...`
+    );
+
+    const ocrText = result.data.text;
+    allRawText += ocrText + ' ';
+
+    let ocrLines = ocrText.split('\n');
+
+// Track last meaningful row index
+let lastRowIndex = -1;
+
+for (let i = 0; i < ocrLines.length; i++) {
+    const line = ocrLines[i].trim();
+
+    //  detect row start (date line)
+    if (/^\d{2}[-\/]\d{2}[-\/]\d{2}/.test(line)) {
+        lastRowIndex = i;
+    }
+
+    // detect amount-only line
+    else if (/^-?\d+[\.,]\d{2}$/.test(line) && lastRowIndex !== -1) {
+        ocrLines[lastRowIndex] += ' ' + line;
+    }
+}
+
+const rows = reconstructInvoiceLines(ocrLines);
+
+
+    const pageResults = [];
+
+    rows.forEach(r => {
+        if (r.BaseAmount !== 0 || r.VatAmount !== 0) {
+            pageResults.push({ Page: job.pageNum, ...r });
+        }
     });
-    
-    if (terms.length === 0) {
-        alert("Please add at least one search term.");
+
+    // ✅ currency fallback
+    if (!appState.currencySymbol) {
+        const detected = safeDetectCurrency([ocrText]);
+        if (detected) appState.currencySymbol = detected;
+    }
+
+    return { pageNum: job.pageNum, rows: pageResults };
+})
+.catch(err => {
+    done++;
+    console.error(`OCR failed on page ${job.pageNum}:`, err);
+    return { pageNum: job.pageNum, rows: [] };
+})
+
+);
+
+
+        const results = await Promise.all(jobs);
+
+// ✅ FIX ORDER
+results.sort((a, b) => a.pageNum - b.pageNum);
+
+// ✅ THEN PUSH
+results.forEach(r => {
+    appState.extractedRows.push(...r.rows);
+});
+
+        await scheduler.terminate();
+    }
+
+    appState.extractedRows.sort((a,b) => a.Page - b.Page);
+    renderTermSuggestions();
+    updateProgressBar(100, `Done — ${appState.extractedRows.length} line items extracted.`);
+    setTimeout(() => {
+        DOM.progressIndicator.classList.add('hidden');
+        DOM.searchBtn.disabled = false;
+        startSecurityTimer();
+    }, 1000);
+}
+
+// ==========================================
+// VAT Calculation Helper
+// The invoice stores GROSS amounts (VAT-inclusive).
+// If vatRate is known: netAmount = grossAmount / (1 + rate/100)
+//                      vatAmount = grossAmount - netAmount
+// If vatRate is null/0: net = gross (no VAT)
+// ==========================================
+function computeVatSplit(grossAmount, vatRate) {
+    if (!vatRate || vatRate === 0) {
+        return { net: grossAmount, vat: 0 };
+    }
+    const net = grossAmount / (1 + vatRate / 100);
+    const vat = grossAmount - net;
+    return { net: Math.round(net * 100) / 100, vat: Math.round(vat * 100) / 100 };
+}
+
+// ==========================================
+// Term Suggestions (frequency-based, no AI/judgment)
+// After extraction, scan every row's description text, strip out the
+// "noisy" parts that make every row look unique (dates, room/check
+// numbers, amounts, VAT %, currency symbols), and count how often each
+// remaining phrase recurs. The most frequent phrases are shown as
+// clickable suggestion chips so the user can add them as search terms
+// with one click instead of typing — this never decides what is
+// "commissionable," it only surfaces what repeats often in this invoice.
+// ==========================================
+function normalizeRowTextForSuggestions(rowText, maxWords = 4) {
+    let s = rowText;
+
+    // Strip a leading date if present
+    s = s.replace(/^\s*\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{2,4}\s*/, '');
+    s = s.replace(/^\s*[|=]\s*/, ''); // OCR noise prefix
+
+    // The actual line-item TYPE (e.g. "City tax", "Comfort kamer",
+    // "Ontbijt - volwassene") is always the very first phrase on the line —
+    // everything after it is guest names, room numbers, amounts, or VAT
+    // detail. Cut the string at the first point any of that "after" content
+    // starts: an opening parenthesis, a digit, a currency symbol/code, an
+    // em/en-dash run, a pipe separator, or guest/room connector phrases.
+    const cutPattern = /[(\d€£$|]|—|--|\bEUR\b|\bGBP\b|\bUSD\b|\bRouted From\b|\bOf Room\b|\bRoom\s*#/i;
+    const cutMatch = s.match(cutPattern);
+    if (cutMatch) s = s.substring(0, cutMatch.index);
+
+    s = s.replace(/[-–—]+$/, '');           // trailing dash left over from the cut
+    s = s.replace(/\s{2,}/g, ' ').trim();
+
+    // Hard cap to a short phrase (2-4 words) — a recurring line-item type
+    // is almost always short; anything longer slipped past the cut above.
+    const words = s.split(/\s+/).filter(Boolean);
+    return words.slice(0, maxWords).join(' ');
+}
+
+function generateTermSuggestions(rows, maxSuggestions = 3) {
+    const counts = new Map(); // normalized phrase -> { count, label }
+
+    for (const row of rows) {
+        const normalized = normalizeRowTextForSuggestions(row.RowText);
+        if (!normalized || normalized.length < 3) continue;
+
+        // Use the normalized phrase as the dedup key, but keep a readable
+        // "best" original-cased label (the shortest normalized match, since
+        // longer ones tend to include leftover guest-name fragments).
+        const key = normalized.toLowerCase();
+        if (!counts.has(key)) {
+            counts.set(key, { count: 0, label: normalized });
+        }
+        const entry = counts.get(key);
+        entry.count++;
+        if (normalized.length < entry.label.length) entry.label = normalized;
+    }
+
+    return [...counts.values()]
+        .filter(e => e.count >= 2)              // only phrases that genuinely recur
+        .sort((a, b) => b.count - a.count)
+        .slice(0, maxSuggestions)
+        .map(e => ({ label: e.label, count: e.count }));
+}
+
+function renderTermSuggestions() {
+    if (!DOM.termSuggestions) return;
+
+    const suggestions = generateTermSuggestions(appState.extractedRows);
+    if (suggestions.length === 0) {
+        DOM.termSuggestions.classList.add('hidden');
+        DOM.termSuggestions.innerHTML = '';
         return;
     }
-    
+
+    DOM.termSuggestions.classList.remove('hidden');
+    DOM.termSuggestions.innerHTML =
+        '<div class="suggestions-header">' +
+            '<p class="suggestions-label">AI suggestion :-) click to add:</p>' +
+            '<button type="button" class="suggestions-dismiss-btn" title="Hide suggestions">' +
+                '<i class="fa-solid fa-xmark"></i>' +
+            '</button>' +
+        '</div>' +
+        '<div class="suggestions-chip-row">' +
+        suggestions.map(s =>
+            `<button type="button" class="suggestion-chip" data-term="${s.label.replace(/"/g, '&quot;')}">
+                ${s.label} <span class="chip-count">${s.count}×</span>
+            </button>`
+        ).join('') +
+        '</div>';
+
+    DOM.termSuggestions.querySelectorAll('.suggestion-chip').forEach(chip => {
+        chip.addEventListener('click', () => addSuggestedTerm(chip.dataset.term));
+    });
+
+    const dismissBtn = DOM.termSuggestions.querySelector('.suggestions-dismiss-btn');
+    if (dismissBtn) {
+        dismissBtn.addEventListener('click', () => {
+            DOM.termSuggestions.classList.add('hidden');
+            DOM.termSuggestions.innerHTML = '';
+        });
+    }
+}
+
+function addSuggestedTerm(termText) {
+    // Reuse an existing empty row if there is one, otherwise add a new row —
+    // never auto-runs the search, just fills the input.
+    const inputs = [...DOM.searchTermsList.querySelectorAll('.term-input')];
+    const emptyInput = inputs.find(i => !i.value.trim());
+    if (emptyInput) {
+        emptyInput.value = termText;
+        return;
+    }
+    const row = document.createElement('div');
+    row.className = 'term-input-row';
+    row.innerHTML = `<input type="text" placeholder="Enter term..." class="term-input" value="${termText.replace(/"/g, '&quot;')}">
+        <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove">
+            <i class="fa-solid fa-xmark"></i></button>`;
+    DOM.searchTermsList.appendChild(row);
+}
+
+
+// Stored entirely in the browser's localStorage — no server, no PDF data
+// involved. Lets the user save the current list of search terms under a
+// name (e.g. "Van der Valk") and reload it on a future visit instead of
+// retyping the same terms every time.
+// ==========================================
+const PRESET_STORAGE_KEY = 'commiiq_term_presets';
+
+function loadPresetsFromStorage() {
+    try {
+        const raw = localStorage.getItem(PRESET_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch (err) {
+        console.error('loadPresetsFromStorage: failed to read/parse presets', err);
+        return {};
+    }
+}
+
+function savePresetsToStorage(presets) {
+    try {
+        localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets));
+        return true;
+    } catch (err) {
+        console.error('savePresetsToStorage: failed to write presets', err);
+        return false;
+    }
+}
+
+function getCurrentTermValues() {
+    return [...DOM.searchTermsList.querySelectorAll('.term-input')]
+        .map(i => i.value.trim())
+        .filter(Boolean);
+}
+
+function setTermInputRows(terms) {
+    // Always leave at least one (possibly empty) row, matching the
+    // existing default state used by clearInvoiceData().
+    const rowsHtml = (terms.length > 0 ? terms : ['']).map(t => `
+        <div class="term-input-row">
+            <input type="text" placeholder="e.g. Night Stay, Room, Package Charge, Logies" class="term-input" value="${t.replace(/"/g, '&quot;')}">
+            <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove term">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+        </div>`).join('');
+    DOM.searchTermsList.innerHTML = rowsHtml;
+}
+
+function refreshPresetDropdown(selectName) {
+    const presets = loadPresetsFromStorage();
+    const names = Object.keys(presets).sort((a, b) => a.localeCompare(b));
+
+    DOM.presetSelect.innerHTML = '<option value="">— Load saved term list —</option>' +
+        names.map(n => `<option value="${n.replace(/"/g, '&quot;')}">${n}</option>`).join('');
+
+    if (selectName && names.includes(selectName)) {
+        DOM.presetSelect.value = selectName;
+    }
+    DOM.deletePresetBtn.disabled = !DOM.presetSelect.value;
+}
+
+function handleSavePreset() {
+    const terms = getCurrentTermValues();
+    if (terms.length === 0) {
+        alert('Add at least one search term before saving a list.');
+        return;
+    }
+    const name = prompt('Save this term list as (e.g. hotel or client name):');
+    if (!name || !name.trim()) return; // user cancelled or entered blank
+
+    const trimmedName = name.trim();
+    const presets = loadPresetsFromStorage();
+    const isOverwrite = Object.prototype.hasOwnProperty.call(presets, trimmedName);
+    if (isOverwrite && !confirm(`A list named "${trimmedName}" already exists. Overwrite it?`)) {
+        return;
+    }
+
+    presets[trimmedName] = terms;
+    if (savePresetsToStorage(presets)) {
+        refreshPresetDropdown(trimmedName);
+    } else {
+        alert('⚠️ Could not save the term list. Your browser may be blocking local storage.');
+    }
+}
+
+function handleLoadPreset() {
+    const name = DOM.presetSelect.value;
+    DOM.deletePresetBtn.disabled = !name;
+    if (!name) return;
+
+    const presets = loadPresetsFromStorage();
+    const terms = presets[name];
+    if (!Array.isArray(terms)) {
+        console.error(`handleLoadPreset: preset "${name}" not found or invalid`);
+        return;
+    }
+    setTermInputRows(terms);
+}
+
+function handleDeletePreset() {
+    const name = DOM.presetSelect.value;
+    if (!name) return;
+    if (!confirm(`Delete the saved term list "${name}"? This cannot be undone.`)) return;
+
+    const presets = loadPresetsFromStorage();
+    delete presets[name];
+    savePresetsToStorage(presets);
+    refreshPresetDropdown();
+}
+
+// ==========================================
+// Audit Search
+// ==========================================
+function executeAuditSearch() {
+    if (appState.extractedRows.length === 0) {
+        alert('No invoice data loaded yet.'); return;
+    }
+    const terms = [...DOM.searchTermsList.querySelectorAll('.term-input')]
+        .map(i => i.value.trim()).filter(Boolean);
+    if (terms.length === 0) { alert('Please add at least one search term.'); return; }
+
     DOM.resultsSection.innerHTML = '';
     DOM.resultsSection.classList.remove('hidden');
-    
-    terms.forEach(term => {
-        const matchedRows = appState.extractedRows.filter(row => {
-            const regex = new RegExp(escapeRegExp(term), 'gi');
-            return row.RowText.match(regex) !== null;
-        });
-        
-        renderTermCard(term, matchedRows);
+    terms.forEach(t => renderTermCard(t,
+        appState.extractedRows.filter(r => new RegExp(escapeRegExp(t),'gi').test(r.RowText))
+    ));
+    DOM.resultsSection.scrollIntoView({ behavior:'smooth' });
+}
+
+function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+
+// ==========================================
+// Render Result Card
+// ==========================================
+// ==========================================
+// Excel Export — per search term
+// Produces a clean .xlsx with one row per matched line item:
+// Page, Date, Description, VAT %, Base (Excl. VAT), VAT Amount, Gross (Incl. VAT)
+// Filename: "<uploaded pdf name>_<TERM>.xlsx"
+// ==========================================
+function exportTermToExcel(term, matchedRows) {
+    if (typeof XLSX === 'undefined') {
+        alert('⚠️ Excel export library failed to load. Please check your internet connection and refresh the page, then try again.');
+        console.error('exportTermToExcel: XLSX (SheetJS) is not defined — check that the xlsx CDN <script> tag is present in index.html and loaded before app.js.');
+        return;
+    }
+
+    const sheetRows = matchedRows.map(row => {
+        const gross = row.BaseAmount;
+        const rate  = (row.VatRate !== null) ? row.VatRate : 0;
+        const split = computeVatSplit(gross, rate);
+        return {
+            'Page':                 row.Page,
+            'Date':                 row.Date || '',
+            'Description':          row.RowText,
+            'VAT %':                rate,
+            'Base (Excl. VAT)':     Number(split.net.toFixed(2)),
+            'VAT Amount':           Number(split.vat.toFixed(2)),
+            'Gross (Incl. VAT)':    Number(gross.toFixed(2))
+        };
     });
-    
-    DOM.resultsSection.scrollIntoView({ behavior: 'smooth' });
+
+    const worksheet = XLSX.utils.json_to_sheet(sheetRows, {
+        header: ['Page', 'Date', 'Description', 'VAT %', 'Base (Excl. VAT)', 'VAT Amount', 'Gross (Incl. VAT)']
+    });
+
+    // Reasonable column widths for readability
+    worksheet['!cols'] = [
+        { wch: 6 },  // Page
+        { wch: 12 }, // Date
+        { wch: 60 }, // Description
+        { wch: 8 },  // VAT %
+        { wch: 16 }, // Base
+        { wch: 14 }, // VAT Amount
+        { wch: 16 }  // Gross
+    ];
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Log');
+
+    // Sanitize term for use in a filename (strip characters illegal on common filesystems)
+    const safeTerm = term.trim().replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, '_') || 'term';
+    const fileName = `${appState.uploadedFileBaseName}_${safeTerm}.xlsx`;
+
+    XLSX.writeFile(workbook, fileName);
 }
 
-function escapeRegExp(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Render term card containing dynamic VAT grouping breakdowns
 function renderTermCard(term, matchedRows) {
     const card = document.createElement('div');
     card.className = 'term-result-box';
-    
+    const cur      = appState.currencySymbol;
+    const fmt      = n => `${n < 0 ? '-' : ''}${cur}${Math.abs(n).toLocaleString('en-GB',
+                           {minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    const fmtFixed = n => `${n < 0 ? '-' : ''}${cur}${Math.abs(n).toFixed(2)}`;
+
+    // European-format display for the three "Combined ..." summary figures
+    // ONLY (Combined Base, Combined VAT, Combined Total) — used so the EUR
+    // figure can be pasted directly onto a commission line in the format
+    // clients expect (€ 25.428,19 instead of €25,428.19). Everything else
+    // (per-VAT-rate breakdown, detailed log table, Excel export) is left
+    // in the standard format on purpose.
+    const fmtCombined = n => {
+        const sign = n < 0 ? '-' : '';
+        const abs  = Math.abs(n).toFixed(2);
+        if (cur !== '€') return `${sign}${cur}${Math.abs(n).toLocaleString('en-GB',
+            {minimumFractionDigits:2,maximumFractionDigits:2})}`;
+        // Standard "25428.19" -> European "25.428,19"
+        const [intPart, decPart] = abs.split('.');
+        const intWithDots = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+        return `${sign}€ ${intWithDots},${decPart}`;
+    };
+
     if (matchedRows.length === 0) {
         card.innerHTML = `
             <div class="term-result-header">
                 <h3>Term: "${term}"</h3>
-                <span class="badge" style="background: var(--danger-light); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.2); box-shadow: none;">0 matches</span>
+                <span class="badge" style="background:var(--danger-light);color:var(--danger);
+                  border:1px solid rgba(239,68,68,.2);box-shadow:none;">0 matches</span>
             </div>
-            <p style="color: var(--text-muted); font-size: 0.95rem;">No items matched this term in the invoice.</p>
-        `;
+            <p style="color:var(--text-muted);font-size:.95rem;">No items matched this term.</p>`;
         DOM.resultsSection.appendChild(card);
         return;
     }
-    
-    // Group matches by VAT rates (e.g. 0, 9, 21, or null/'N/A')
-    const vatGroups = {};
-    let totalBase = 0.0;
-    let totalVat = 0.0;
-    
-    matchedRows.forEach(row => {
-        const rateKey = row.VatRate !== null ? `${row.VatRate}%` : 'Other/Unknown';
-        
-        if (!vatGroups[rateKey]) {
-            vatGroups[rateKey] = {
-                rateLabel: rateKey,
-                count: 0,
-                baseSum: 0.0,
-                vatSum: 0.0,
-                grossSum: 0.0,
-                rows: []
-            };
-        }
-        
-        vatGroups[rateKey].count++;
-        vatGroups[rateKey].baseSum += row.BaseAmount;
-        vatGroups[rateKey].vatSum += row.VatAmount;
-        vatGroups[rateKey].grossSum += (row.BaseAmount + row.VatAmount);
-        vatGroups[rateKey].rows.push(row);
-        
-        totalBase += row.BaseAmount;
-        totalVat += row.VatAmount;
-    });
-    
-    const totalGross = totalBase + totalVat;
-    
-    // Build VAT Breakdown HTML lines
-    let vatBreakdownRowsHtml = '';
-    Object.keys(vatGroups).sort().forEach(key => {
-        const g = vatGroups[key];
-        vatBreakdownRowsHtml += `
-            <div class="vat-breakdown-row">
-                <span class="vat-rate-label">${g.rateLabel}</span>
-                <span class="text-right" style="font-weight: 600;">${g.count}</span>
-                <span class="text-right">€${g.baseSum.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                <span class="text-right">€${g.vatSum.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                <span class="text-right" style="font-weight: 700; color: var(--text-main);">€${g.grossSum.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-            </div>
-        `;
-    });
-    
-    // Build Detailed Rows Table Lines
-    let tableRowsHtml = '';
-    matchedRows.forEach(row => {
-        const regex = new RegExp(`(${escapeRegExp(term)})`, 'gi');
-        const highlightedText = row.RowText.replace(regex, `<span class="highlight-match">$1</span>`);
-        
-        const rateLabel = row.VatRate !== null ? `${row.VatRate}%` : '<span style="color: var(--text-muted);">N/A</span>';
-        
-        tableRowsHtml += `
-            <tr>
-                <td>Page ${row.Page}</td>
-                <td>${row.Date ? row.Date : '<span style="color: var(--text-muted); font-style: italic;">No Date</span>'}</td>
-                <td>${highlightedText}</td>
-                <td class="text-right">${row.VatRate !== null ? rateLabel : 'Other'}</td>
-                <td class="text-right">€${row.BaseAmount.toFixed(2)}</td>
-                <td class="text-right">€${row.VatAmount.toFixed(2)}</td>
-                <td class="text-right" style="font-weight: 600; color: var(--text-main);">€${(row.BaseAmount + row.VatAmount).toFixed(2)}</td>
-            </tr>
-        `;
-    });
-    
-    // Set Card Container HTML
+
+    // Group by VAT rate; compute net/vat split per row
+    const groups = {};
+    let totalNet = 0, totalVat = 0, totalGross = 0;
+
+    for (const row of matchedRows) {
+        // BaseAmount from invoice is GROSS (VAT-inclusive)
+        const gross = row.BaseAmount;
+        const rate  = (row.VatRate !== null) ? row.VatRate : 0;
+        const split = computeVatSplit(gross, rate);
+        const net   = split.net;
+        const vat   = split.vat;
+
+        const key = rate > 0 ? `${rate}%` : 'Other/Unknown (0%)';
+        if (!groups[key]) groups[key] = { rateLabel:key, count:0,
+                                           netSum:0, vatSum:0, grossSum:0, rows:[] };
+        groups[key].count++;
+        groups[key].netSum   += net;
+        groups[key].vatSum   += vat;
+        groups[key].grossSum += gross;
+        groups[key].rows.push({ ...row, _net: net, _vat: vat });
+
+        totalNet   += net;
+        totalVat   += vat;
+        totalGross += gross;
+    }
+
+    const breakdownHtml = Object.keys(groups).sort().map(k => {
+        const g = groups[k];
+        return `<div class="vat-breakdown-row">
+            <span class="vat-rate-label">${g.rateLabel}</span>
+            <span class="text-right" style="font-weight:600">${g.count}</span>
+            <span class="text-right">${fmt(g.netSum)}</span>
+            <span class="text-right">${fmt(g.vatSum)}</span>
+            <span class="text-right" style="font-weight:700;color:var(--text-main)">${fmt(g.grossSum)}</span>
+        </div>`;
+    }).join('');
+
+    const tableHtml = matchedRows.map(row => {
+        const gross  = row.BaseAmount;
+        const rate   = (row.VatRate !== null) ? row.VatRate : 0;
+        const split  = computeVatSplit(gross, rate);
+        const hl     = row.RowText.replace(
+            new RegExp(`(${escapeRegExp(term)})`, 'gi'),
+            '<span class="highlight-match">$1</span>');
+        const rLabel = rate > 0 ? `${rate}%`
+                     : `<span style="color:var(--text-muted)">0%</span>`;
+        return `<tr>
+            <td>Page ${row.Page}</td>
+            <td>${row.Date || '<span style="color:var(--text-muted);font-style:italic">No Date</span>'}</td>
+            <td>${hl}</td>
+            <td class="text-right">${rLabel}</td>
+            <td class="text-right">${fmtFixed(split.net)}</td>
+            <td class="text-right">${fmtFixed(split.vat)}</td>
+            <td class="text-right" style="font-weight:600;color:var(--text-main)">${fmtFixed(gross)}</td>
+        </tr>`;
+    }).join('');
+
     card.innerHTML = `
         <div class="term-result-header">
             <h3>Term: "${term}"</h3>
             <span class="badge">${matchedRows.length} matches</span>
         </div>
-        
         <div class="vat-breakdown-grid">
             <div class="vat-breakdown-row header-row">
                 <span>VAT Rate</span>
@@ -521,208 +1220,192 @@ function renderTermCard(term, matchedRows) {
                 <span class="text-right">Total VAT</span>
                 <span class="text-right">Total Gross (Incl. VAT)</span>
             </div>
-            ${vatBreakdownRowsHtml}
+            ${breakdownHtml}
         </div>
-        
         <div class="term-combined-summary">
             <div class="summary-metric">
-                <span class="metric-label">Combined Base</span>
-                <span class="metric-val">€${totalBase.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span class="metric-label">Combined Base (Excl. VAT)</span>
+                <span class="metric-val">${fmtCombined(totalNet)}</span>
             </div>
             <div class="summary-metric">
                 <span class="metric-label">Combined VAT</span>
-                <span class="metric-val">€${totalVat.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span class="metric-val">${fmtCombined(totalVat)}</span>
             </div>
             <div class="summary-metric highlight">
-                <span class="metric-label">Combined Total</span>
-                <span class="metric-val">€${totalGross.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span class="metric-label">Combined Total (Incl. VAT)</span>
+                <span class="metric-val">${fmtCombined(totalGross)}</span>
             </div>
         </div>
-        
         <div class="term-details-control">
-            <button class="btn btn-secondary btn-sm toggle-details-btn" onclick="toggleDetailsLog(this)">
-                <i class="fa-solid fa-chevron-down"></i> View Detailed Log
-            </button>
-            
+            <div class="term-details-actions">
+                <button class="btn btn-secondary btn-sm toggle-details-btn" onclick="toggleDetailsLog(this)">
+                    <i class="fa-solid fa-chevron-down"></i> View Detailed Log
+                </button>
+                <button class="btn btn-secondary btn-sm export-excel-btn">
+                    <i class="fa-solid fa-file-excel"></i> View in Excel
+                </button>
+            </div>
             <div class="details-log-wrapper hidden">
                 <div class="table-wrapper">
                     <table class="audit-table">
-                        <thead>
-                            <tr>
-                                <th>Page</th>
-                                <th>Date</th>
-                                <th>Matched Item Description</th>
-                                <th class="text-right">VAT Rate</th>
-                                <th class="text-right">Base Amount</th>
-                                <th class="text-right">VAT Amount</th>
-                                <th class="text-right">Gross Total</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${tableRowsHtml}
-                        </tbody>
+                        <thead><tr>
+                            <th>Page</th><th>Date</th><th>Description</th>
+                            <th class="text-right">VAT %</th>
+                            <th class="text-right">Base (Excl. VAT)</th>
+                            <th class="text-right">VAT Amount</th>
+                            <th class="text-right">Gross (Incl. VAT)</th>
+                        </tr></thead>
+                        <tbody>${tableHtml}</tbody>
                     </table>
                 </div>
             </div>
-        </div>
-    `;
+        </div>`;
     DOM.resultsSection.appendChild(card);
+
+    const exportBtn = card.querySelector('.export-excel-btn');
+    if (exportBtn) {
+        exportBtn.addEventListener('click', () => exportTermToExcel(term, matchedRows));
+    } else {
+        console.warn('renderTermCard: .export-excel-btn not found in rendered card');
+    }
 }
 
-// Global Toggle Details function
 window.toggleDetailsLog = function(btn) {
-    const wrapper = btn.nextElementSibling;
-    
-    if (wrapper.classList.contains('hidden')) {
-        wrapper.classList.remove('hidden');
-        btn.innerHTML = `<i class="fa-solid fa-chevron-up"></i> Hide Detailed Log`;
-    } else {
-        wrapper.classList.add('hidden');
-        btn.innerHTML = `<i class="fa-solid fa-chevron-down"></i> View Detailed Log`;
+    // Find the log wrapper relative to the shared parent container
+    // (.term-details-control) rather than assuming sibling order — this
+    // stays correct even if more buttons are added alongside this one.
+    const container = btn.closest('.term-details-control');
+    const w = container ? container.querySelector('.details-log-wrapper') : btn.nextElementSibling;
+    if (!w) {
+        console.error('toggleDetailsLog: could not find .details-log-wrapper');
+        return;
     }
+    const collapsed = w.classList.contains('hidden');
+    w.classList.toggle('hidden', !collapsed);
+    btn.innerHTML = collapsed
+        ? '<i class="fa-solid fa-chevron-up"></i> Hide Detailed Log'
+        : '<i class="fa-solid fa-chevron-down"></i> View Detailed Log';
 };
 
 // ==========================================
-// Security Timer & Reset Controllers
+// Security Timer
 // ==========================================
 function startSecurityTimer() {
     clearInterval(appState.timerInterval);
-    appState.countdownSeconds = 1200; // Reset to 20 minutes
+    appState.countdownSeconds = 1260;
     DOM.securityTimer.classList.remove('hidden');
-    
     updateTimerDisplay();
     appState.timerInterval = setInterval(() => {
-        appState.countdownSeconds--;
-        updateTimerDisplay();
-        
-        if (appState.countdownSeconds <= 0) {
+        if (--appState.countdownSeconds <= 0) {
             clearInvoiceData();
-            alert("⏰ Security Alert: 20 minutes elapsed. For data privacy, invoice data has been auto-deleted.");
+            alert('⏰ 20 minutes elapsed — data auto-deleted for privacy.');
         }
+        updateTimerDisplay();
     }, 1000);
 }
 
 function updateTimerDisplay() {
-    const mins = Math.floor(appState.countdownSeconds / 60);
-    const secs = appState.countdownSeconds % 60;
-    DOM.countdownDisplay.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    const m = Math.floor(appState.countdownSeconds/60);
+    const s = appState.countdownSeconds % 60;
+    DOM.countdownDisplay.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
 
 function clearInvoiceData() {
     clearInterval(appState.timerInterval);
     appState.extractedRows = [];
-    
-    // UI Reset
-    DOM.fileInput.value = '';
+    DOM.fileInput.value     = '';
     DOM.fileStatusContainer.classList.add('hidden');
     DOM.progressIndicator.classList.add('hidden');
     DOM.securityTimer.classList.add('hidden');
     DOM.resultsSection.classList.add('hidden');
     DOM.resultsSection.innerHTML = '';
     DOM.searchBtn.disabled = true;
-    
-    // Re-initialize default inputs
     DOM.searchTermsList.innerHTML = `
         <div class="term-input-row">
-            <input type="text" placeholder="e.g. Night Stay, Room, Package Charge, Logies" class="term-input">
-            <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove term">
-                <i class="fa-solid fa-xmark"></i>
-            </button>
-        </div>
-    `;
+            <input type="text" placeholder="e.g. Night Stay, Room, Package Charge" class="term-input">
+            <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove">
+                <i class="fa-solid fa-xmark"></i></button>
+        </div>`;
+    if (DOM.termSuggestions) {
+        DOM.termSuggestions.classList.add('hidden');
+        DOM.termSuggestions.innerHTML = '';
+    }
 }
 
-function updateProgressBar(percentage, text) {
+function updateProgressBar(pct, text) {
     DOM.progressIndicator.classList.remove('hidden');
-    DOM.progressBar.style.width = `${percentage}%`;
+    DOM.progressBar.style.width = `${pct}%`;
     DOM.progressText.textContent = text;
 }
 
 // ==========================================
-// Application Core Events
+// Event Binding
 // ==========================================
 function initAppEvents() {
-    // Theme Toggle Controller
     DOM.themeToggleBtn.addEventListener('click', () => {
-        if (document.body.classList.contains('theme-dark-yellow')) {
-            document.body.classList.remove('theme-dark-yellow');
-            document.body.classList.add('theme-dark-blue');
-        } else {
-            document.body.classList.remove('theme-dark-blue');
-            document.body.classList.add('theme-dark-yellow');
-        }
+        document.body.classList.toggle('theme-dark-yellow');
+        document.body.classList.toggle('theme-dark-blue');
     });
-
-    // File Picker Handler
     DOM.fileInput.addEventListener('change', handleFileSelect);
-    
-    // Dropzone Drag-and-drop Events
-    ['dragenter', 'dragover'].forEach(eventName => {
-        DOM.dropzone.addEventListener(eventName, e => {
-            e.preventDefault();
-            DOM.dropzone.classList.add('dragover');
-        }, false);
-    });
-    
-    ['dragleave', 'drop'].forEach(eventName => {
-        DOM.dropzone.addEventListener(eventName, e => {
-            e.preventDefault();
-            DOM.dropzone.classList.remove('dragover');
-        }, false);
-    });
-    
+    ['dragenter','dragover'].forEach(ev =>
+        DOM.dropzone.addEventListener(ev, e => {
+            e.preventDefault(); DOM.dropzone.classList.add('dragover');
+        }, false));
+    ['dragleave','drop'].forEach(ev =>
+        DOM.dropzone.addEventListener(ev, e => {
+            e.preventDefault(); DOM.dropzone.classList.remove('dragover');
+        }, false));
     DOM.dropzone.addEventListener('drop', e => {
-        const files = e.dataTransfer.files;
-        if (files.length > 0 && files[0].type === 'application/pdf') {
-            DOM.fileInput.files = files;
-            handleFileSelect();
-        } else {
-            alert("Please drop a valid PDF file.");
-        }
+        const f = e.dataTransfer.files[0];
+        if (f && f.type==='application/pdf') { DOM.fileInput.files=e.dataTransfer.files; handleFileSelect(); }
+        else alert('Please drop a valid PDF file.');
     });
-
-    // Add search term fields
     DOM.addTermBtn.addEventListener('click', () => {
         const row = document.createElement('div');
         row.className = 'term-input-row';
-        row.innerHTML = `
-            <input type="text" placeholder="Enter term..." class="term-input">
-            <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove term">
-                <i class="fa-solid fa-xmark"></i>
-            </button>
-        `;
+        row.innerHTML = `<input type="text" placeholder="Enter term..." class="term-input">
+            <button class="btn-remove-term" onclick="this.parentElement.remove()" title="Remove">
+                <i class="fa-solid fa-xmark"></i></button>`;
         DOM.searchTermsList.appendChild(row);
         row.querySelector('.term-input').focus();
     });
-
-    // Search and Delete actions
     DOM.searchBtn.addEventListener('click', executeAuditSearch);
     DOM.clearDataBtn.addEventListener('click', clearInvoiceData);
+    DOM.savePresetBtn.addEventListener('click', handleSavePreset);
+    DOM.deletePresetBtn.addEventListener('click', handleDeletePreset);
+    DOM.presetSelect.addEventListener('change', handleLoadPreset);
+
+    refreshPresetDropdown();
 }
 
 function handleFileSelect() {
     const file = DOM.fileInput.files[0];
     if (!file) return;
-    
+
+    // Enforce PDF type selection before proceeding
+    const selectedRadio = DOM.pdfTypeRadios();
+    if (!selectedRadio) {
+        alert('Please select the PDF type (Scanned or Text-based) before uploading.');
+        DOM.fileInput.value = ''; // reset so user can re-select
+        return;
+    }
+    const pdfType = selectedRadio.value; // 'scanned' or 'text'
+
     DOM.fileStatusContainer.classList.remove('hidden');
     DOM.fileNameDisplay.textContent = file.name;
-    DOM.fileSizeDisplay.textContent = `${Math.round(file.size / 1024).toLocaleString()} KB`;
-    
+    DOM.fileSizeDisplay.textContent = `${Math.round(file.size/1024).toLocaleString()} KB`;
+    appState.uploadedFileBaseName = file.name.replace(/\.pdf$/i, '') || 'invoice';
     DOM.resultsSection.classList.add('hidden');
     DOM.resultsSection.innerHTML = '';
     DOM.securityTimer.classList.add('hidden');
     DOM.searchBtn.disabled = true;
-    
     const reader = new FileReader();
-    reader.onload = function(e) {
-        processInvoice(e.target.result).catch(error => {
-            console.error(error);
-            updateProgressBar(0, "Error occurred during file parsing.");
-            alert("❌ An error occurred while parsing the invoice. Please verify if it's a valid PDF.");
-        });
-    };
+    reader.onload = e => processInvoice(e.target.result, pdfType).catch(err => {
+        console.error(err);
+        updateProgressBar(0,'Error during parsing.');
+        alert('❌ Failed to parse invoice. Check the browser console for details.');
+    });
     reader.readAsArrayBuffer(file);
 }
 
-// Run events binding on page load
 window.addEventListener('DOMContentLoaded', initAppEvents);
