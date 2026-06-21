@@ -200,7 +200,13 @@ function parseAmountAndVat(line) {
         .replace(/§/g, '5')
         // lowercase-l vs digit-1: use lookahead so "l,465" (comma between l and digit)
         // is also caught, not just "l4" where the digit is immediately adjacent
-        .replace(/l(?=[,.\d])/g, '1').replace(/(?<=[,.\d])l/g, '1');
+        .replace(/l(?=[,.\d])/g, '1').replace(/(?<=[,.\d])l/g, '1')
+        // OCR sometimes collapses the space before a '%' sign into a stray
+        // trailing '9' (observed: "21 %" misread as "219%", "9 %" as "99%").
+        // A real VAT rate here is always one of 0/9/21 — if a 3-digit number
+        // ending in 9 immediately before '%' isn't itself a plausible rate,
+        // assume the trailing 9 is the OCR artifact and drop it.
+        .replace(/\b(0|9|21)9%/g, '$1%');
     s = s.replace(/CHECK#?\s*\d+\b/gi, '');
     s = s.replace(/\b(19|20)\d{2}\b/g, '');
 
@@ -286,13 +292,15 @@ if (dotCount > 1 && commaCount === 0) {
     if (baseAmount !== 0) {
         const negativeDetected =
             // Real negative sign: '-' directly touching a digit (no space between
-            // sign and number), e.g. "-60.00", "-1.50". A hyphen used as word
-            // punctuation always has a space on BOTH sides (e.g. "kamer - mindervalide"),
-            // so requiring no space between '-' and the digit excludes that case
-            // while still catching "- 60.00" is NOT matched here on purpose —
+            // sign and number), e.g. "-60.00", "-1.50" — optionally with a
+            // currency symbol sandwiched between the sign and the digit, e.g.
+            // "-€5091.18". A hyphen used as word punctuation always has a space
+            // on BOTH sides (e.g. "kamer - mindervalide"), so requiring no space
+            // between '-' and the symbol/digit excludes that case while still
+            // catching "- 60.00" is NOT matched here on purpose —
             // OCR'd negatives in our invoices never insert a space after the sign,
             // only before it (handled by allowing one space before '-').
-            /(?:^|\s)-\d/.test(line) ||
+            /(?:^|\s)-[€$£]?\d/.test(line) ||
             // "(" + digits + ")" NOT followed by "%)" → accounting-style negative, e.g. "(271,90)"
             // "(21 %)" or "(0 %)" → VAT-rate annotation, NOT a negative
             /\((?!\s*\d+(?:\.\d+)?\s*%\))[\s€$£]*\d[\d,.]*[\s€$£]*\)/.test(line) ||
@@ -316,7 +324,12 @@ if (dotCount > 1 && commaCount === 0) {
 // ==========================================
 function isTextBasedPage(lines) {
     const text = lines.join(' ');
-    if (text.length < 100) return false;
+    // This floor exists only to catch pages with NO real embedded text layer
+    // (a scanned/image-only page returns next to nothing from getTextContent).
+    // It must stay low enough that short-but-legitimate text-based invoices
+    // (e.g. a 2-3 line hotel folio) aren't misclassified as scanned just for
+    // being short — the date/amount checks below do the actual classifying.
+    if (text.length < 15) return false;
     
     // Check if there are decimal amounts
     const stdMatches = text.match(/\b\d+[\d,]*\.\d{2}\b/g) || [];
@@ -358,6 +371,40 @@ function reconstructInvoiceLines(lines) {
     const rows = [];
     let currentItem = null;
 
+    // Recognizable end-of-page legal/registration boilerplate (IBAN, BIC,
+    // KvK/VAT registration numbers, web domains, phone number prefixes,
+    // standard hospitality-terms-and-conditions phrasing). These reliably
+    // never appear in genuine line-item continuation text (guest names,
+    // room numbers, booking references), so a line matching this is never
+    // folded into a charge row — without this, footer text was silently
+    // glued onto whatever the last row on the page happened to be.
+    const FOOTER_BOILERPLATE_PATTERN =
+        /\b(BIC|IBAN|Kv\.?K\.?|BTW|VAT\s*nr|BTW-?Nummer|RFP\s*ID)\b/i;
+    const FOOTER_BOILERPLATE_PATTERN_2 = /\.(com|nl|org|net)\b/i;
+    const FOOTER_PHONE_PATTERN = /\bT\.\s*\+?\d/;
+    const FOOTER_TERMS_PATTERN = /Uniforme Voorwaarden|Conditions for the Hotel/i;
+    function looksLikeFooterBoilerplate(text) {
+        return FOOTER_BOILERPLATE_PATTERN.test(text) ||
+               FOOTER_BOILERPLATE_PATTERN_2.test(text) ||
+               FOOTER_PHONE_PATTERN.test(text) ||
+               FOOTER_TERMS_PATTERN.test(text);
+    }
+
+    // A line carrying a "bare" 2+ digit number that isn't a room/booking
+    // reference (#NNNN), a booking-ref suffix (=>...), or a date — this is
+    // the shape of an OCR-corrupted charge line whose amount AND date both
+    // failed to parse (e.g. "City tax 946" — "9.46" with the decimal point
+    // dropped, date prefix also lost). Genuine continuation fragments
+    // (guest names, "Routed From X Of Room #NNNN") never have a leftover
+    // bare number once those patterns are stripped.
+    function hasUnclaimedDigits(text) {
+        const cleaned = text
+            .replace(/#\s*\d+/g, '')
+            .replace(/=>.*/g, '')
+            .replace(/\b\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4}\b/g, '');
+        return /\d{2,}/.test(cleaned);
+    }
+
     for (const raw of lines) {
         const line = raw.trim();
         if (!line) continue;
@@ -372,9 +419,23 @@ function reconstructInvoiceLines(lines) {
 
         const details = parseAmountAndVat(cleanForAmt);
 
+        // Footer/legal boilerplate is never part of any charge row — drop
+        // it as noise rather than letting it merge onto whatever row came
+        // before it (Merge B below would otherwise treat it as harmless
+        // continuation text, since it typically has no date or amount).
+        if (looksLikeFooterBoilerplate(line)) {
+            continue;
+        }
+
         if (currentItem) {
-            // ✅ Merge A: date line without amount, next line has amount
-            if (currentItem.Date && !currentItem.BaseAmount && details.baseAmount) {
+            // Merge A: date line without amount, next line has amount.
+            // Guard: only merge if the next line does NOT carry its own date.
+            // A line with its own date is a new, separate charge — merging it
+            // in would silently steal its amount onto the wrong row (this is
+            // exactly what happened when OCR corrupted a "City tax" line's
+            // amount, e.g. "City tax .46", and the merge logic grabbed the
+            // amount from the next unrelated "Package Charge 182.50" line).
+            if (currentItem.Date && !currentItem.BaseAmount && details.baseAmount && !date) {
                 currentItem.RowText += " | " + line;
                 currentItem.BaseAmount = details.baseAmount;
                 currentItem.VatAmount = details.vatAmount;
@@ -382,8 +443,15 @@ function reconstructInvoiceLines(lines) {
                 continue;
             }
 
-            // Merge B: continuation text
-            if (!date && !details.baseAmount && !details.vatAmount) {
+            // Merge B: continuation text — but only if the line doesn't
+            // itself look like a corrupted charge line (a bare, unclaimed
+            // number that isn't a room/booking reference or date). Without
+            // this guard, a line like "City tax 946" with NO date (OCR lost
+            // both the date prefix and the decimal point) would silently
+            // disappear into the previous row's text instead of surfacing
+            // as its own (zero-amount, auditable) row.
+            const looksLikeOrphanedChargeLine = !date && !details.baseAmount && !details.vatAmount && hasUnclaimedDigits(line);
+            if (!date && !details.baseAmount && !details.vatAmount && !looksLikeOrphanedChargeLine) {
                 currentItem.RowText += " | " + line;
                 continue;
             }
@@ -398,6 +466,15 @@ function reconstructInvoiceLines(lines) {
             VatAmount: details.vatAmount,
             VatRate: details.vatRate
         };
+        // Flag rows that exist ONLY because they were kept out of Merge B —
+        // a genuine charge line whose amount (and often date) failed to
+        // parse, as opposed to a line that legitimately produced no row at
+        // all. Downstream filtering keeps NeedsReview rows even though
+        // BaseAmount is 0, so the row stays visible/auditable instead of
+        // silently vanishing from the count.
+        if (!date && !details.baseAmount && !details.vatAmount && hasUnclaimedDigits(line)) {
+            currentItem.NeedsReview = true;
+        }
     }
 
     if (currentItem) rows.push(currentItem);
@@ -553,7 +630,8 @@ async function processInvoiceText(arrayBuffer) {
         updateProgressBar(Math.round((i / totalPages) * 90) + 5,
                           `Extracting text page ${i}/${totalPages}...`);
         const page      = await pdf.getPage(i);
-        const textLines = await extractTextFromPDFPage(page);
+        const rawTextLines = await extractTextFromPDFPage(page);
+        const textLines = rawTextLines.map(applyOcrWordCorrections);
         allRawText     += textLines.join(' ') + ' ';
 
         const rows = reconstructInvoiceLinesText(textLines);
@@ -672,6 +750,33 @@ function reconstructInvoiceLinesText(lines) {
 }
 
 // ==========================================
+// OCR Word-Level Correction
+//
+// Tesseract occasionally misreads specific characters within a known word
+// due to font/scan artifacts (e.g. "b" read as "h" at low DPI: "Ontbijt"
+// becomes "Onthijt"). This is different from the digit-confusion fixes in
+// parseAmountAndVat — those fix numbers, this fixes recurring whole-word
+// misreads in descriptions, which matters because search terms need to
+// match the description text exactly (e.g. searching "Ontbijt" must catch
+// every row, not just the ones OCR happened to read correctly).
+//
+// Kept as a small, explicit list rather than a fuzzy/edit-distance pass,
+// so it only ever corrects known, observed misreadings and never risks
+// silently rewriting unrelated text.
+// ==========================================
+const OCR_WORD_CORRECTIONS = [
+    [/\bOnthijt\b/gi, 'Ontbijt'] // "b" misread as "h" — observed on Van der Valk invoices
+];
+
+function applyOcrWordCorrections(text) {
+    let corrected = text;
+    for (const [pattern, replacement] of OCR_WORD_CORRECTIONS) {
+        corrected = corrected.replace(pattern, replacement);
+    }
+    return corrected;
+}
+
+// ==========================================
 // Core Processing Pipeline
 // ==========================================
 async function processInvoice(arrayBuffer, pdfType) {
@@ -694,18 +799,24 @@ async function processInvoice(arrayBuffer, pdfType) {
     for (let i = 1; i <= totalPages; i++) {
         updateProgressBar(Math.round((i/totalPages)*20)+5, `Scanning page ${i}/${totalPages}...`);
         const page      = await pdf.getPage(i);
-        const textLines = await extractTextFromPDFPage(page);
+        const rawTextLines = await extractTextFromPDFPage(page);
+        // Apply the same word-level OCR correction used on Tesseract output —
+        // a PDF's own embedded text layer (baked in by the scanner/printer
+        // software, not by this app) can carry identical misreads, and this
+        // path can run instead of Tesseract whenever isTextBasedPage finds
+        // enough dates/amounts to treat the page as already text-based.
+        const textLines = rawTextLines.map(applyOcrWordCorrections);
         allRawText     += textLines.join(' ') + ' ';
 
         if (isTextBasedPage(textLines)) {
             const rows = reconstructInvoiceLines(textLines);
-            const hasRows = rows.some(r => r.BaseAmount !== 0 || r.VatAmount !== 0);
+            const hasRows = rows.some(r => r.BaseAmount !== 0 || r.VatAmount !== 0 || r.NeedsReview);
             if (!hasRows) {
                 const canvas = await renderPageToCanvas(page); // render only if text fallback fails
                 scannedJobs.push({ pageNum: i, canvas });
             } else {
                 const pageResults = rows
-                    .filter(r => r.BaseAmount !== 0 || r.VatAmount !== 0)
+                    .filter(r => r.BaseAmount !== 0 || r.VatAmount !== 0 || r.NeedsReview)
                     .map(r => ({ Page: i, ...r }));
                 appState.extractedRows.push(...pageResults);
             }
@@ -769,7 +880,7 @@ async function processInvoice(arrayBuffer, pdfType) {
         `OCR ${done}/${totalScanned} pages...`
     );
 
-    const ocrText = result.data.text;
+    const ocrText = applyOcrWordCorrections(result.data.text);
     allRawText += ocrText + ' ';
 
     let ocrLines = ocrText.split('\n');
@@ -797,12 +908,12 @@ const rows = reconstructInvoiceLines(ocrLines);
     const pageResults = [];
 
     rows.forEach(r => {
-        if (r.BaseAmount !== 0 || r.VatAmount !== 0) {
+        if (r.BaseAmount !== 0 || r.VatAmount !== 0 || r.NeedsReview) {
             pageResults.push({ Page: job.pageNum, ...r });
         }
     });
 
-    // ✅ currency fallback
+    // currency fallback
     if (!appState.currencySymbol) {
         const detected = safeDetectCurrency([ocrText]);
         if (detected) appState.currencySymbol = detected;
@@ -821,10 +932,10 @@ const rows = reconstructInvoiceLines(ocrLines);
 
         const results = await Promise.all(jobs);
 
-// ✅ FIX ORDER
+// FIX ORDER
 results.sort((a, b) => a.pageNum - b.pageNum);
 
-// ✅ THEN PUSH
+// THEN PUSH
 results.forEach(r => {
     appState.extractedRows.push(...r.rows);
 });
@@ -1138,12 +1249,13 @@ function exportTermToExcel(term, matchedRows) {
             'VAT %':                rate,
             'Base (Excl. VAT)':     Number(split.net.toFixed(2)),
             'VAT Amount':           Number(split.vat.toFixed(2)),
-            'Gross (Incl. VAT)':    Number(gross.toFixed(2))
+            'Gross (Incl. VAT)':    Number(gross.toFixed(2)),
+            'Needs Review':         row.NeedsReview ? 'OCR could not read amount — check source PDF' : ''
         };
     });
 
     const worksheet = XLSX.utils.json_to_sheet(sheetRows, {
-        header: ['Page', 'Date', 'Description', 'VAT %', 'Base (Excl. VAT)', 'VAT Amount', 'Gross (Incl. VAT)']
+        header: ['Page', 'Date', 'Description', 'VAT %', 'Base (Excl. VAT)', 'VAT Amount', 'Gross (Incl. VAT)', 'Needs Review']
     });
 
     // Reasonable column widths for readability
@@ -1154,7 +1266,8 @@ function exportTermToExcel(term, matchedRows) {
         { wch: 8 },  // VAT %
         { wch: 16 }, // Base
         { wch: 14 }, // VAT Amount
-        { wch: 16 }  // Gross
+        { wch: 16 }, // Gross
+        { wch: 40 }  // Needs Review
     ];
 
     const workbook = XLSX.utils.book_new();
@@ -1250,16 +1363,33 @@ function renderTermCard(term, matchedRows) {
             '<span class="highlight-match">$1</span>');
         const rLabel = rate > 0 ? `${rate}%`
                      : `<span style="color:var(--text-muted)">0%</span>`;
-        return `<tr>
+        // NeedsReview: OCR could not read this row's amount (and often its
+        // date). It's still shown — not silently dropped — so the count
+        // stays honest, but it's flagged clearly since €0.00 here means
+        // "unreadable," not "actually zero," and needs a manual check
+        // against the source PDF.
+        const reviewBadge = row.NeedsReview
+            ? ' <span class="badge" style="background:var(--warning-light,#fff3cd);color:var(--warning,#92660a);border:1px solid rgba(146,102,10,.25);box-shadow:none;font-size:.7rem;vertical-align:middle;" title="OCR could not read this amount — check the source PDF">⚠ needs review</span>'
+            : '';
+        const rowStyle = row.NeedsReview ? ' style="background:rgba(245,158,11,0.08);"' : '';
+        return `<tr${rowStyle}>
             <td>Page ${row.Page}</td>
             <td>${row.Date || '<span style="color:var(--text-muted);font-style:italic">No Date</span>'}</td>
-            <td>${hl}</td>
+            <td>${hl}${reviewBadge}</td>
             <td class="text-right">${rLabel}</td>
             <td class="text-right">${fmtFixed(split.net)}</td>
             <td class="text-right">${fmtFixed(split.vat)}</td>
             <td class="text-right" style="font-weight:600;color:var(--text-main)">${fmtFixed(gross)}</td>
         </tr>`;
     }).join('');
+
+    const needsReviewCount = matchedRows.filter(r => r.NeedsReview).length;
+    const needsReviewNotice = needsReviewCount > 0
+        ? `<div class="needs-review-notice" style="margin:.5rem 0;padding:.6rem .9rem;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:8px;font-size:.85rem;color:var(--text-main);">
+            <i class="fa-solid fa-triangle-exclamation" style="color:#92660a;"></i>
+            ${needsReviewCount} row${needsReviewCount > 1 ? 's' : ''} could not be read by OCR and ${needsReviewCount > 1 ? 'are' : 'is'} shown as €0.00 — check the "needs review" row${needsReviewCount > 1 ? 's' : ''} in the detailed log against the source PDF.
+        </div>`
+        : '';
 
     card.innerHTML = `
         <div class="term-result-header">
@@ -1290,6 +1420,7 @@ function renderTermCard(term, matchedRows) {
                 <span class="metric-val">${fmtCombined(totalGross)}</span>
             </div>
         </div>
+        ${needsReviewNotice}
         <div class="term-details-control">
             <div class="term-details-actions">
                 <button class="btn btn-secondary btn-sm toggle-details-btn" onclick="toggleDetailsLog(this)">
@@ -1352,7 +1483,7 @@ function startSecurityTimer() {
     appState.timerInterval = setInterval(() => {
         if (--appState.countdownSeconds <= 0) {
             clearInvoiceData();
-            alert('⏰ 20 minutes elapsed — data auto-deleted for privacy.');
+            alert('⏰ 21 minutes elapsed — data auto-deleted for privacy.');
         }
         updateTimerDisplay();
     }, 1000);
@@ -1453,6 +1584,7 @@ function handleFileSelect() {
     DOM.resultsSection.innerHTML = '';
     DOM.securityTimer.classList.add('hidden');
     DOM.searchBtn.disabled = true;
+
     const reader = new FileReader();
     reader.onload = e => processInvoice(e.target.result, pdfType).catch(err => {
         console.error(err);
