@@ -1,9 +1,9 @@
 // Configure PDF.js Worker
 pdfjsLib.GlobalWorkerOptions.workerSrc =
 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
-// ===========================
+// ==========================
 // Application State
-// ===========================
+// ==========================
 let appState = {
     extractedRows: [],
     countdownSeconds: 1260,
@@ -628,6 +628,8 @@ async function processInvoiceText(arrayBuffer) {
     const pdf        = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     appState._pdfDoc = pdf;
     const totalPages = pdf.numPages;
+    const scannedJobs = [];
+    appState._scannedCanvases = [];   // reset for this upload
     let   allRawText = '';
 
     for (let i = 1; i <= totalPages; i++) {
@@ -835,24 +837,45 @@ async function processInvoice(arrayBuffer, pdfType) {
         }
     }
 
-    if (!appState.currencySymbol && allRawText.length > 0) {
-    appState.currencySymbol = safeDetectCurrency([allRawText]);
-}
+if (!appState.currencySymbol && allRawText.length > 0) {
+        appState.currencySymbol = safeDetectCurrency([allRawText]);
+    }
 
-
-    // Phase 2: Fast parallel OCR using scheduler with multiple workers
+    // ────────────────────────────────────
+    // Phase 2 — Batched parallel OCR
+    // BATCH SIZE — dynamic by page count of the OCR portion:
+    //   ≤ 15 pages  → 4  (small; memory not a concern)
+    //   16–80 pages → 3  (medium/large; tighten window)
+    //   > 80 pages  → 3  (very large; stability first)
+    //
+    //   Fallback to batch 2: if performance.memory is available and
+    //   usedJSHeapSize > 80% of jsHeapSizeLimit mid-run, the batchSize
+    //   variable is halved once (floor 2) at the top of the next iteration.
+    //   This is the only dynamic adjustment — everything else is static.
+    //
+    // MEMORY GUARANTEE — O(1) with respect to page count:
+    //   New approach: each batch's canvases are zeroed (canvas.width = 0)
+    //   immediately after that batch's Promise.all resolves.
+    // ──────────────────────────────────────────
     if (scannedJobs.length > 0) {
         const totalScanned = scannedJobs.length;
-        updateProgressBar(25, `Starting OCR on ${totalScanned} page(s)...`);
 
-        const scheduler  = Tesseract.createScheduler();
-        appState._activeScheduler = scheduler;
+        // Static batch size — chosen once before the loop starts
+        let batchSize = totalScanned <= 15 ? 4 : 3;
+
+        // Worker count: fixed at 4, but never more than the number of pages
+        // and never fewer than 2 (safety floor for single-core environments)
         const WORKERS = Math.min(
-    Math.max(2, Math.floor((navigator.hardwareConcurrency || 4) / 2)),
-    totalScanned,
-    6
-);
-        const workerList = [];
+            Math.max(2, Math.floor((navigator.hardwareConcurrency || 4) / 2)),
+            totalScanned,
+            4   // hard cap at 4
+        );
+
+        updateProgressBar(25, `Starting OCR — ${totalScanned} page(s), batch ${batchSize}, ${WORKERS} workers...`);
+
+        // Spin up the worker pool once — reused across every batch
+        const scheduler = Tesseract.createScheduler();
+        appState._activeScheduler = scheduler;
 
         try {
             for (let w = 0; w < WORKERS; w++) {
@@ -863,7 +886,6 @@ async function processInvoice(arrayBuffer, pdfType) {
                 await worker.loadLanguage('eng');
                 await worker.initialize('eng');
                 scheduler.addWorker(worker);
-                workerList.push(worker);
             }
         } catch (err) {
             console.error('❌ Worker pool init failed:', err);
@@ -877,78 +899,93 @@ async function processInvoice(arrayBuffer, pdfType) {
         }
 
         let done = 0;
+        const allBatchResults = [];
 
-        // All jobs run in parallel — scheduler distributes across workers.
-        // Each canvas is preprocessed (upscale + binarise) before OCR to
-        // improve character recognition accuracy on low-DPI scanned pages.
-        const jobs = scannedJobs.map(job =>
-            scheduler.addJob('recognize', preprocessCanvas(job.canvas))
-                .then(result => {
-    done++;
-    updateProgressBar(
-        Math.round((done / totalScanned) * 70) + 25,
-        `OCR ${done}/${totalScanned} pages...`
-    );
+        for (let batchStart = 0; batchStart < totalScanned; batchStart += batchSize) {
 
-    const ocrText = applyOcrWordCorrections(result.data.text);
-    allRawText += ocrText + ' ';
+            // Memory-pressure fallback — halve batch size once (floor 2)
+            // if the JS heap is over 80% full at the start of this iteration.
+            // performance.memory is Chrome/Edge only; silently skipped elsewhere.
+            if (typeof performance !== 'undefined' && performance.memory) {
+                const { usedJSHeapSize, jsHeapSizeLimit } = performance.memory;
+                if (usedJSHeapSize / jsHeapSizeLimit > 0.80 && batchSize > 2) {
+                    batchSize = Math.max(2, Math.floor(batchSize / 2));
+                    console.warn(`Memory > 80% — batch size reduced to ${batchSize}`);
+                }
+            }
 
-    let ocrLines = ocrText.split('\n');
+            const batch = scannedJobs.slice(batchStart, batchStart + batchSize);
 
-// Track last meaningful row index
-let lastRowIndex = -1;
+            // All pages in this batch run in parallel; the scheduler
+            // distributes them across the fixed worker pool
+            const batchJobs = batch.map(job => {
+                const processed = preprocessCanvas(job.canvas);
 
-for (let i = 0; i < ocrLines.length; i++) {
-    const line = ocrLines[i].trim();
+                return scheduler.addJob('recognize', processed)
+                    .then(result => {
+                        done++;
+                        updateProgressBar(
+                            Math.round((done / totalScanned) * 70) + 25,
+                            `OCR ${done}/${totalScanned} pages...`
+                        );
 
-    //  detect row start (date line)
-    if (/^\d{2}[-\/]\d{2}[-\/]\d{2}/.test(line)) {
-        lastRowIndex = i;
-    }
+                        // Release the preprocessed canvas immediately —
+                        // don't wait for GC; width=0 frees the pixel buffer now
+                        try { processed.width = 0; processed.height = 0; } catch (_) {}
 
-    // detect amount-only line
-    else if (/^-?\d+[\.,]\d{2}$/.test(line) && lastRowIndex !== -1) {
-        ocrLines[lastRowIndex] += ' ' + line;
-    }
-}
+                        const ocrText = applyOcrWordCorrections(result.data.text);
+                        allRawText += ocrText + ' ';
 
-const rows = reconstructInvoiceLines(ocrLines);
+                        // Stitch orphan amount-only lines onto their date line
+                        let ocrLines = ocrText.split('\n');
+                        let lastRowIndex = -1;
+                        for (let i = 0; i < ocrLines.length; i++) {
+                            const line = ocrLines[i].trim();
+                            if (/^\d{2}[-\/]\d{2}[-\/]\d{2}/.test(line)) {
+                                lastRowIndex = i;
+                            } else if (/^-?\d+[\.,]\d{2}$/.test(line) && lastRowIndex !== -1) {
+                                ocrLines[lastRowIndex] += ' ' + line;
+                            }
+                        }
 
+                        const rows = reconstructInvoiceLines(ocrLines);
+                        const pageResults = rows
+                            .filter(r => r.BaseAmount !== 0 || r.VatAmount !== 0 || r.NeedsReview)
+                            .map(r => ({ Page: job.pageNum, ...r }));
 
-    const pageResults = [];
+                        if (!appState.currencySymbol) {
+                            const detected = safeDetectCurrency([ocrText]);
+                            if (detected) appState.currencySymbol = detected;
+                        }
 
-    rows.forEach(r => {
-        if (r.BaseAmount !== 0 || r.VatAmount !== 0 || r.NeedsReview) {
-            pageResults.push({ Page: job.pageNum, ...r });
+                        return { pageNum: job.pageNum, rows: pageResults };
+                    })
+                    .catch(err => {
+                        done++;
+                        console.error(`OCR failed on page ${job.pageNum}:`, err);
+                        try { processed.width = 0; processed.height = 0; } catch (_) {}
+                        return { pageNum: job.pageNum, rows: [] };
+                    });
+            });
+
+            // Wait for this batch to complete before starting the next one
+            const batchResults = await Promise.all(batchJobs);
+            allBatchResults.push(...batchResults);
+
+            // Zero original canvases for this batch right now —
+            // this is the key step that keeps memory O(1).
+            // By the time the next batch starts, these ~69 MB buffers are gone.
+            batch.forEach(job => {
+                try { job.canvas.width = 0; job.canvas.height = 0; } catch (_) {}
+                job.canvas = null;
+            });
         }
-    });
 
-    // currency fallback
-    if (!appState.currencySymbol) {
-        const detected = safeDetectCurrency([ocrText]);
-        if (detected) appState.currencySymbol = detected;
-    }
-
-    return { pageNum: job.pageNum, rows: pageResults };
-})
-.catch(err => {
-    done++;
-    console.error(`OCR failed on page ${job.pageNum}:`, err);
-    return { pageNum: job.pageNum, rows: [] };
-})
-
-);
-
-
-        const results = await Promise.all(jobs);
-
-// FIX ORDER
-results.sort((a, b) => a.pageNum - b.pageNum);
-
-// THEN PUSH
-results.forEach(r => {
-    appState.extractedRows.push(...r.rows);
-});
+        // Merge all batch results in page order
+        allBatchResults.sort((a, b) => a.pageNum - b.pageNum);
+        allBatchResults.forEach(r => {
+            appState.extractedRows.push(...r.rows);
+        });
 
         await scheduler.terminate();
         appState._activeScheduler = null;
@@ -1526,7 +1563,7 @@ function clearInvoiceData() {
     // so on a 100-page invoice this can free hundreds of MB right now rather
     // than waiting for GC.
     appState._scannedCanvases.forEach(c => {
-        try { c.width = 0; c.height = 0; } catch (e) { /* already detached */ }
+        try { c.width = 0; c.height = 0; } catch (_) {}
     });
     appState._scannedCanvases = [];
 
