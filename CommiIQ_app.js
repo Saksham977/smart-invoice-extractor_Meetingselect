@@ -9,7 +9,10 @@ let appState = {
     countdownSeconds: 1260,
     timerInterval: null,
     currencySymbol: '',
-    uploadedFileBaseName: 'invoice'
+    uploadedFileBaseName: 'invoice',
+    _pdfDoc: null,          // holds pdf.js document so clearInvoiceData can destroy it
+    _scannedCanvases: [],  // holds canvas refs so clearInvoiceData can zero them
+    _activeScheduler: null// holds Tesseract scheduler if mid-OCR when user deletes
 };
 
 // ==========================================
@@ -623,6 +626,7 @@ async function processInvoiceText(arrayBuffer) {
     updateProgressBar(5, 'Loading PDF (text mode)...');
 
     const pdf        = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    appState._pdfDoc = pdf;
     const totalPages = pdf.numPages;
     let   allRawText = '';
 
@@ -791,8 +795,10 @@ async function processInvoice(arrayBuffer, pdfType) {
     updateProgressBar(5, 'Loading PDF...');
 
     const pdf        = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    appState._pdfDoc = pdf;
     const totalPages = pdf.numPages;
     const scannedJobs = [];
+    appState._scannedCanvases = [];
     let   allRawText  = '';
 
     // Phase 1: classify each page
@@ -814,7 +820,9 @@ async function processInvoice(arrayBuffer, pdfType) {
             if (!hasRows) {
                 const canvas = await renderPageToCanvas(page); // render only if text fallback fails
                 scannedJobs.push({ pageNum: i, canvas });
-            } else {
+                appState._scannedCanvases.push(canvas);
+            } 
+            else{
                 const pageResults = rows
                     .filter(r => r.BaseAmount !== 0 || r.VatAmount !== 0 || r.NeedsReview)
                     .map(r => ({ Page: i, ...r }));
@@ -823,6 +831,7 @@ async function processInvoice(arrayBuffer, pdfType) {
         } else {
             const canvas = await renderPageToCanvas(page); // render since it requires OCR
             scannedJobs.push({ pageNum: i, canvas });
+            appState._scannedCanvases.push(canvas);
         }
     }
 
@@ -837,6 +846,7 @@ async function processInvoice(arrayBuffer, pdfType) {
         updateProgressBar(25, `Starting OCR on ${totalScanned} page(s)...`);
 
         const scheduler  = Tesseract.createScheduler();
+        appState._activeScheduler = scheduler;
         const WORKERS = Math.min(
     Math.max(2, Math.floor((navigator.hardwareConcurrency || 4) / 2)),
     totalScanned,
@@ -941,6 +951,7 @@ results.forEach(r => {
 });
 
         await scheduler.terminate();
+        appState._activeScheduler = null;
     }
 
     appState.extractedRows.sort((a,b) => a.Page - b.Page);
@@ -1495,9 +1506,44 @@ function updateTimerDisplay() {
     DOM.countdownDisplay.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
 
+//To Clear Invoice Data:)
 function clearInvoiceData() {
     clearInterval(appState.timerInterval);
-    appState.extractedRows = [];
+
+    // ── Destroy the pdf.js document ──────────────────────────────────────────
+    // pdf.destroy() is pdf.js's own API — it frees the internal page tree,
+    // font caches, and content streams it built from the ArrayBuffer.
+    // Without this, that memory is only freed when GC decides to run.
+    if (appState._pdfDoc) {
+        appState._pdfDoc.destroy();
+        appState._pdfDoc = null;
+    }
+
+    // ── Zero all canvas backing stores ───────────────────────────────────────
+    // Setting canvas.width = 0 / canvas.height = 0 releases the pixel buffer
+    // immediately — this is the only cross-browser way to free canvas GPU/CPU
+    // memory before GC runs. Each scanned page canvas is ~69 MB at 4× scale,
+    // so on a 100-page invoice this can free hundreds of MB right now rather
+    // than waiting for GC.
+    appState._scannedCanvases.forEach(c => {
+        try { c.width = 0; c.height = 0; } catch (e) { /* already detached */ }
+    });
+    appState._scannedCanvases = [];
+
+    // ── Terminate Tesseract scheduler if OCR was mid-flight ─────────────────
+    // If the user clicks "Delete Now" while OCR is still running on a large
+    // invoice, the scheduler and its workers keep consuming CPU and memory
+    // until they finish — unless we terminate them explicitly here.
+    if (appState._activeScheduler) {
+        appState._activeScheduler.terminate().catch(() => {});
+        appState._activeScheduler = null;
+    }
+
+    // ── Clear parsed data ────────────────────────────────────────────────────
+    appState.extractedRows  = [];
+    appState.currencySymbol = '';
+
+    // ── Reset UI ─────────────────────────────────────────────────────────────
     DOM.fileInput.value     = '';
     DOM.fileStatusContainer.classList.add('hidden');
     DOM.progressIndicator.classList.add('hidden');
