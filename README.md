@@ -1,4 +1,4 @@
-# smart-invoice-extractor_Meetingselect
+# smart-invoice-extractor_CommiIQ
 AI-powered invoice parsing engine with OCR fallback and intelligent amount extraction.
 
 Project Summary
